@@ -1,0 +1,1758 @@
+#!/usr/bin/env bash
+# =============================================================================
+# req — Requirements Management CLI
+# =============================================================================
+#
+# A command-line tool for managing system requirements in a local SQLite
+# database. Designed to run without a server, with zero dependencies beyond
+# bash and sqlite3.
+#
+# LOCATION:
+#   specs/req              — this script
+#   specs/schema.sql       — database schema
+#   specs/requirements.db  — SQLite database (created by `req init`)
+#
+# USAGE:
+#   req <command> [options]
+#
+# COMMANDS:
+#   init                              Create or migrate the database
+#   module add <name> [description]   Register a named module
+#   module list                       List all modules
+#   add [module] [--batch]            Add a requirement (interactive or batch)
+#   import [module] <file.yaml>       Import requirements from YAML
+#   list [filters...]                 List requirements with optional filters
+#   show <display_id> [--module M] [--format yaml]  Show full detail for one requirement
+#   update <display_id> [--module M]  Update from YAML on stdin (all fields incl. criteria)
+#   edit <display_id> <field> <value> [--module M]  Update a single scalar field
+#   tag <display_id> add|rm <tag> [--module M]      Manage tags
+#   depend <display_id> add|rm <target_id> [--module M]  Manage dependencies
+#   rm <display_id> [--module M]      Soft-delete a requirement
+#   purge <days>                      Permanently remove soft-deleted requirements older than N days
+#   export [filters...]               Export to YAML or CSV
+#   snapshot                          Export all modules to YAML files (for git)
+#   restore                           Rebuild database from snapshot YAML files
+#   stats [--module M]                Summary statistics
+#   check [--module M]                Quality checks (missing criteria, etc.)
+#   help                              Show this help
+#
+#   When module is omitted, the 'default' module is used.
+#
+# FILTERS (for list and export):
+#   --module <name>       Filter by module name
+#   --priority <p>        Filter by priority (must|should|could|wont)
+#   --category <c>        Filter by category (AUTH|DATA|UI|API|PERF|SEC|INT|BIZ|INF)
+#   --tag <t>             Filter by tag
+#   --type <t>            Filter by type (functional|non-functional|constraint|interface)
+#   --status <s>          Filter by status (active|deprecated|deleted) [default: active]
+#   --format <f>          Output format for export (yaml|csv) [default: yaml]
+#
+# EXAMPLES:
+#   req init
+#   req add                                           # uses default module
+#   req import requirements.yaml                      # uses default module
+#   req list --priority must
+#   req show AUTH-001
+#   req show AUTH-001 --format yaml
+#   req show AUTH-001 --format yaml | sed 's/old/new/' | req update AUTH-001
+#   req edit AUTH-001 priority must
+#   req tag AUTH-001 add security
+#   req export --format yaml > export.yaml
+#   req snapshot
+#   req restore
+#   req stats
+#   req check
+#
+#   # Named modules (optional):
+#   req module add workforce-core "Core module"
+#   req add workforce-core
+#   req import workforce-core requirements.yaml
+#   req show AUTH-001 --module workforce-core
+#
+# NOTES FOR CLAUDE CODE:
+#   - Database path is always specs/requirements.db relative to this script.
+#   - Schema is in specs/schema.sql. Run `req init` to apply.
+#   - Display IDs (e.g., AUTH-001) are derived from category + seq.
+#   - The seq is auto-assigned as max(seq)+1 within (module, category).
+#   - All deletes are soft-deletes (status='deleted'). Use --status deleted to see them.
+#   - Use `req purge <days>` to permanently remove soft-deletes older than N days.
+#   - The import command reads YAML files matching the format defined in the
+#     spec-writer skill (.claude/skills/spec-writer/SKILL.md).
+#   - Use `req update <ID>` to update any field including acceptance criteria
+#     via YAML on stdin. Use `req show <ID> --format yaml` for the round-trip.
+#   - To add new commands, follow the cmd_* function pattern below.
+#   - Categories can be extended by modifying the CHECK constraint in schema.sql
+#     and the VALID_CATEGORIES array below.
+#   - Snapshots write one YAML file per module to specs/snapshots/<module>.yaml.
+#     These files are the git-versioned source of truth. The database is derived.
+#   - The restore command rebuilds the database entirely from snapshot files.
+#   - A git pre-commit hook should run `req snapshot` before each commit.
+#
+# DEPENDENCIES:
+#   - bash 4+
+#   - sqlite3 (preinstalled on macOS and most Linux)
+#
+# =============================================================================
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DB_PATH="${SCRIPT_DIR}/requirements.db"
+SCHEMA_PATH="${SCRIPT_DIR}/schema.sql"
+SNAPSHOT_DIR="${SCRIPT_DIR}/snapshots"
+DEFAULT_MODULE="default"
+
+VALID_CATEGORIES=("AUTH" "DATA" "UI" "API" "PERF" "SEC" "INT" "BIZ" "INF")
+VALID_PRIORITIES=("must" "should" "could" "wont")
+VALID_TYPES=("functional" "non-functional" "constraint" "interface")
+VALID_STATUSES=("active" "deprecated" "deleted")
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+warn() { echo "WARN: $*" >&2; }
+info() { echo "$*"; }
+
+# Run a SQL statement against the database. Usage: sql "SELECT ..." or sql <<< "..."
+sql() {
+    if [[ $# -gt 0 ]]; then
+        sqlite3 -batch "$DB_PATH" "$1"
+    else
+        sqlite3 -batch "$DB_PATH"
+    fi
+}
+
+# Run SQL and return results as columns with headers
+sql_table() {
+    sqlite3 -batch -header -column "$DB_PATH" "$1"
+}
+
+# Run SQL and return tab-separated values (for scripting)
+sql_tsv() {
+    sqlite3 -batch -separator $'\t' "$DB_PATH" "$1"
+}
+
+# Check the database exists
+require_db() {
+    [[ -f "$DB_PATH" ]] || die "Database not found. Run 'req init' first."
+}
+
+# Validate a value is in an array. Usage: validate_in "must" "${VALID_PRIORITIES[@]}"
+validate_in() {
+    local value="$1"; shift
+    local arr=("$@")
+    for v in "${arr[@]}"; do
+        [[ "$v" == "$value" ]] && return 0
+    done
+    die "Invalid value '$value'. Must be one of: ${arr[*]}"
+}
+
+# Resolve a module name to its ID, or die
+resolve_module() {
+    local name="$1"
+    local mid
+    mid=$(sql "SELECT id FROM modules WHERE name='$(echo "$name" | sed "s/'/''/g")';")
+    [[ -n "$mid" ]] || die "Module '$name' not found. Run 'req module list' to see modules."
+    echo "$mid"
+}
+
+# Return the default module's ID, auto-creating it if needed
+default_module_id() {
+    local mid
+    mid=$(sql "SELECT id FROM modules WHERE name='${DEFAULT_MODULE}';")
+    if [[ -z "$mid" ]]; then
+        mid=$(sql "INSERT INTO modules (name, description) VALUES ('${DEFAULT_MODULE}', 'Default module'); SELECT last_insert_rowid();")
+    fi
+    echo "$mid"
+}
+
+# Resolve a display_id (e.g., AUTH-001) to internal ID within a module
+# Usage: resolve_requirement AUTH-001 <module_id>
+resolve_requirement() {
+    local display_id="$1"
+    local module_id="$2"
+    local category seq rid
+
+    category="${display_id%%-*}"
+    seq="${display_id##*-}"
+    seq=$((10#$seq))  # strip leading zeros
+
+    rid=$(sql "SELECT id FROM requirements WHERE module_id=${module_id} AND category='${category}' AND seq=${seq};")
+    [[ -n "$rid" ]] || die "Requirement '${display_id}' not found in this module."
+    echo "$rid"
+}
+
+# Get next sequence number for a category within a module
+next_seq() {
+    local module_id="$1"
+    local category="$2"
+    local max_seq
+    max_seq=$(sql "SELECT COALESCE(MAX(seq),0) FROM requirements WHERE module_id=${module_id} AND category='${category}';")
+    echo $((max_seq + 1))
+}
+
+# Prompt for input with a default value. Usage: prompt "Summary" "" result_var
+prompt_input() {
+    local label="$1"
+    local default="$2"
+    local varname="$3"
+    local input
+
+    if [[ -n "$default" ]]; then
+        read -rp "${label} [${default}]: " input
+        eval "${varname}='${input:-$default}'"
+    else
+        read -rp "${label}: " input
+        eval "${varname}='${input}'"
+    fi
+}
+
+# Prompt for selection from a list. Usage: prompt_select "Priority" result_var must should could wont
+prompt_select() {
+    local label="$1"
+    local varname="$2"
+    shift 2
+    local options=("$@")
+    local i
+
+    echo "${label}:"
+    for i in "${!options[@]}"; do
+        echo "  $((i+1))) ${options[$i]}"
+    done
+
+    local choice
+    read -rp "Select [1]: " choice
+    choice=${choice:-1}
+
+    if [[ "$choice" -ge 1 && "$choice" -le "${#options[@]}" ]]; then
+        eval "${varname}='${options[$((choice-1))]}'"
+    else
+        die "Invalid selection."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+# --- init -----------------------------------------------------------------
+# Create or migrate the database from schema.sql.
+# Idempotent: safe to run multiple times. Uses IF NOT EXISTS throughout.
+# --------------------------------------------------------------------------
+cmd_init() {
+    [[ -f "$SCHEMA_PATH" ]] || die "Schema not found at ${SCHEMA_PATH}"
+    sqlite3 "$DB_PATH" < "$SCHEMA_PATH"
+    sql "INSERT OR IGNORE INTO modules (name, description) VALUES ('${DEFAULT_MODULE}', 'Default module');"
+    info "Database initialised at ${DB_PATH}"
+}
+
+# --- module ---------------------------------------------------------------
+# Manage modules (Maven modules or logical groupings).
+#   module add <name> [description]
+#   module list
+# --------------------------------------------------------------------------
+cmd_module() {
+    local subcmd="${1:-}"; shift || true
+
+    case "$subcmd" in
+        add)
+            local name="${1:-}"
+            [[ -n "$name" ]] || die "Usage: req module add <name> [description]"
+            local desc="${2:-}"
+            sql "INSERT INTO modules (name, description) VALUES ('$(echo "$name" | sed "s/'/''/g")', '$(echo "$desc" | sed "s/'/''/g")');"
+            info "Module '${name}' created."
+            ;;
+        list)
+            require_db
+            sql_table "SELECT name, description, created_at FROM modules ORDER BY name;"
+            ;;
+        *)
+            die "Usage: req module <add|list>"
+            ;;
+    esac
+}
+
+# --- add ------------------------------------------------------------------
+# Add a requirement interactively.
+# Prompts for category, type, priority, summary, detail, and acceptance
+# criteria. Assigns the next sequence number automatically.
+#
+# Usage: req add <module>
+#
+# Batch mode (--batch) reads from stdin as tab-separated fields:
+#   category<TAB>type<TAB>priority<TAB>summary<TAB>detail<TAB>criterion1;criterion2
+# --------------------------------------------------------------------------
+cmd_add() {
+    require_db
+    local module_name="${1:-${DEFAULT_MODULE}}"
+    local module_id
+    module_id=$(resolve_module "$module_name")
+    shift || true
+
+    if [[ "${1:-}" == "--batch" ]]; then
+        cmd_add_batch "$module_id"
+        return
+    fi
+
+    local category type priority summary detail
+
+    prompt_select "Category" category "${VALID_CATEGORIES[@]}"
+    prompt_select "Type" type "${VALID_TYPES[@]}"
+    prompt_select "Priority" priority "${VALID_PRIORITIES[@]}"
+    prompt_input "Summary (max ~120 chars)" "" summary
+    [[ -n "$summary" ]] || die "Summary is required."
+    prompt_input "Detail (optional, press enter to skip)" "" detail
+
+    local seq
+    seq=$(next_seq "$module_id" "$category")
+    local display_id="${category}-$(printf '%03d' "$seq")"
+
+    local rid
+    rid=$(sql "INSERT INTO requirements (module_id, category, seq, type, priority, summary, detail)
+         VALUES (${module_id}, '${category}', ${seq}, '${type}', '${priority}',
+                 '$(echo "$summary" | sed "s/'/''/g")',
+                 '$(echo "$detail" | sed "s/'/''/g")');
+         SELECT last_insert_rowid();")
+
+    info ""
+    info "Acceptance criteria (one per line, empty line to finish):"
+    local criterion order=0
+    while true; do
+        read -rp "  - " criterion
+        [[ -n "$criterion" ]] || break
+        sql "INSERT INTO acceptance (requirement_id, criterion, sort_order)
+             VALUES (${rid}, '$(echo "$criterion" | sed "s/'/''/g")', ${order});"
+        order=$((order + 1))
+    done
+
+    info ""
+    info "Tags (comma-separated, or press enter to skip):"
+    local tags_input
+    read -rp "  " tags_input
+    if [[ -n "$tags_input" ]]; then
+        IFS=',' read -ra tags <<< "$tags_input"
+        for tag in "${tags[@]}"; do
+            tag=$(echo "$tag" | xargs)  # trim whitespace
+            [[ -n "$tag" ]] && sql "INSERT OR IGNORE INTO requirement_tags (requirement_id, tag)
+                                    VALUES (${rid}, '$(echo "$tag" | sed "s/'/''/g")');"
+        done
+    fi
+
+    info ""
+    info "Created ${display_id}: ${summary}"
+}
+
+cmd_add_batch() {
+    local module_id="$1"
+    local count=0
+    while IFS=$'\t' read -r category type priority summary detail criteria; do
+        validate_in "$category" "${VALID_CATEGORIES[@]}"
+        validate_in "$type" "${VALID_TYPES[@]}"
+        validate_in "$priority" "${VALID_PRIORITIES[@]}"
+
+        local seq
+        seq=$(next_seq "$module_id" "$category")
+
+        local rid
+        rid=$(sql "INSERT INTO requirements (module_id, category, seq, type, priority, summary, detail)
+             VALUES (${module_id}, '${category}', ${seq}, '${type}', '${priority}',
+                     '$(echo "$summary" | sed "s/'/''/g")',
+                     '$(echo "$detail" | sed "s/'/''/g")');
+             SELECT last_insert_rowid();")
+
+        if [[ -n "$criteria" ]]; then
+            local order=0
+            IFS=';' read -ra crits <<< "$criteria"
+            for c in "${crits[@]}"; do
+                c=$(echo "$c" | xargs)
+                [[ -n "$c" ]] && sql "INSERT INTO acceptance (requirement_id, criterion, sort_order)
+                                      VALUES (${rid}, '$(echo "$c" | sed "s/'/''/g")', ${order});"
+                order=$((order + 1))
+            done
+        fi
+
+        count=$((count + 1))
+    done
+    info "Imported ${count} requirements in batch mode."
+}
+
+# --- import ---------------------------------------------------------------
+# Import requirements from a YAML file matching the requirements-extractor
+# skill format. Parses the YAML line-by-line (no external YAML parser needed).
+#
+# Expects the format:
+#   - id: AUTH-001
+#     type: functional
+#     priority: must
+#     summary: User can sign in with email and password
+#     detail: >
+#       Optional multi-line detail.
+#     accepts:
+#       - Valid credentials return 200
+#       - Invalid credentials return 401
+#     depends: [AUTH-001]
+#     tags: [onboarding, security]
+#
+# Usage: req import <module> <file.yaml>
+# --------------------------------------------------------------------------
+cmd_import() {
+    require_db
+    local module_name=""
+    local yaml_file=""
+    if [[ "${1:-}" =~ \.(yaml|yml)$ ]]; then
+        module_name="${DEFAULT_MODULE}"
+        yaml_file="$1"
+    else
+        module_name="${1:-}"
+        yaml_file="${2:-}"
+    fi
+    [[ -n "$module_name" ]] || die "Usage: req import [module] <file.yaml>"
+    [[ -n "$yaml_file" ]]   || die "Usage: req import [module] <file.yaml>"
+    [[ -f "$yaml_file" ]]   || die "File not found: ${yaml_file}"
+
+    local module_id
+    module_id=$(resolve_module "$module_name")
+
+    local count=0
+    local skipped=0
+    local in_req=false
+    local in_accepts=false
+    local in_tags=false
+    local in_depends=false
+    local in_detail=false
+    local category="" seq="" type="" priority="" summary="" detail=""
+    local -a accepts=()
+    local -a tags=()
+    local -a depends=()
+
+    flush_requirement() {
+        [[ -n "$category" && -n "$summary" ]] || return 0
+
+        # Use seq from YAML id if present, otherwise auto-assign
+        local use_seq
+        if [[ -n "$seq" ]]; then
+            use_seq=$((10#$seq))
+        else
+            use_seq=$(next_seq "$module_id" "$category")
+        fi
+
+        type="${type:-functional}"
+        priority="${priority:-should}"
+
+        # Skip if this (module, category, seq) already exists
+        local display_id="${category}-$(printf '%03d' "$use_seq")"
+        local existing
+        existing=$(sql "SELECT id FROM requirements WHERE module_id=${module_id} AND category='${category}' AND seq=${use_seq};")
+        if [[ -n "$existing" ]]; then
+            warn "  Skipped ${display_id}: already exists"
+            skipped=$((skipped + 1))
+            category="" seq="" type="" priority="" summary="" detail=""
+            accepts=() tags=() depends=()
+            in_accepts=false in_tags=false in_depends=false in_detail=false
+            return 0
+        fi
+
+        local rid
+        rid=$(sql "INSERT INTO requirements (module_id, category, seq, type, priority, summary, detail)
+             VALUES (${module_id}, '${category}', ${use_seq}, '${type}', '${priority}',
+                     '$(echo "$summary" | sed "s/'/''/g")',
+                     '$(echo "$detail" | sed "s/'/''/g")');
+             SELECT last_insert_rowid();")
+
+        local order=0
+        for ac in ${accepts[@]+"${accepts[@]}"}; do
+            sql "INSERT INTO acceptance (requirement_id, criterion, sort_order)
+                 VALUES (${rid}, '$(echo "$ac" | sed "s/'/''/g")', ${order});"
+            order=$((order + 1))
+        done
+
+        for tag in ${tags[@]+"${tags[@]}"}; do
+            sql "INSERT OR IGNORE INTO requirement_tags (requirement_id, tag)
+                 VALUES (${rid}, '$(echo "$tag" | sed "s/'/''/g")');"
+        done
+
+        # Dependency resolution deferred — store as tags for now, resolve after full import
+        for dep in ${depends[@]+"${depends[@]}"}; do
+            sql "INSERT OR IGNORE INTO requirement_tags (requirement_id, tag)
+                 VALUES (${rid}, 'depends:$(echo "$dep" | sed "s/'/''/g")');"
+        done
+
+        info "  Imported ${display_id}: ${summary}"
+        count=$((count + 1))
+
+        # Reset
+        category="" seq="" type="" priority="" summary="" detail=""
+        accepts=() tags=() depends=()
+        in_accepts=false in_tags=false in_depends=false in_detail=false
+    }
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip comments and blank lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && { in_detail=false; continue; }
+
+        # New requirement block
+        if [[ "$line" =~ ^-[[:space:]]+id:[[:space:]]*([A-Z]+)-([0-9]+) ]]; then
+            flush_requirement
+            in_req=true
+            in_accepts=false; in_tags=false; in_depends=false; in_detail=false
+            category="${BASH_REMATCH[1]}"
+            seq="${BASH_REMATCH[2]}"
+            continue
+        fi
+
+        # Only parse if we're inside a requirement block
+        $in_req || continue
+
+        # Acceptance criteria items
+        if $in_accepts && [[ "$line" =~ ^[[:space:]]+-[[:space:]]+(.*) ]]; then
+            accepts+=("${BASH_REMATCH[1]}")
+            continue
+        elif $in_accepts && [[ ! "$line" =~ ^[[:space:]]+- ]]; then
+            in_accepts=false
+        fi
+
+        # Multi-line detail continuation
+        if $in_detail && [[ "$line" =~ ^[[:space:]]{4,} ]]; then
+            local trimmed
+            trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
+            detail="${detail} ${trimmed}"
+            continue
+        elif $in_detail; then
+            in_detail=false
+        fi
+
+        # Field parsing
+        if [[ "$line" =~ ^[[:space:]]+type:[[:space:]]*(.*) ]]; then
+            type="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+priority:[[:space:]]*(.*) ]]; then
+            priority="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+summary:[[:space:]]*(.*) ]]; then
+            summary="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+detail:[[:space:]]*\> ]]; then
+            in_detail=true
+            detail=""
+        elif [[ "$line" =~ ^[[:space:]]+detail:[[:space:]]*(.*) ]]; then
+            detail="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+accepts: ]]; then
+            in_accepts=true
+            in_tags=false; in_depends=false; in_detail=false
+        elif [[ "$line" =~ ^[[:space:]]+tags:[[:space:]]*\[(.*)\] ]]; then
+            IFS=',' read -ra raw_tags <<< "${BASH_REMATCH[1]}"
+            for t in "${raw_tags[@]}"; do
+                t=$(echo "$t" | xargs)
+                [[ -n "$t" ]] && tags+=("$t")
+            done
+        elif [[ "$line" =~ ^[[:space:]]+depends:[[:space:]]*\[(.*)\] ]]; then
+            IFS=',' read -ra raw_deps <<< "${BASH_REMATCH[1]}"
+            for d in "${raw_deps[@]}"; do
+                d=$(echo "$d" | xargs)
+                [[ -n "$d" ]] && depends+=("$d")
+            done
+        fi
+
+    done < "$yaml_file"
+
+    # Flush the last requirement
+    flush_requirement
+
+    info ""
+    info "Imported ${count} requirement(s) into module '${module_name}'."
+    [[ "$skipped" -eq 0 ]] || warn "Skipped ${skipped} duplicate(s)."
+}
+
+# --- list -----------------------------------------------------------------
+# List requirements with optional filters.
+#
+# Usage: req list [--module M] [--priority P] [--category C] [--tag T]
+#                 [--type T] [--status S]
+#
+# Default: shows active requirements across all modules.
+# --------------------------------------------------------------------------
+cmd_list() {
+    require_db
+
+    local module="" priority="" category="" tag="" type="" status="active"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --module)   module="$2"; shift 2 ;;
+            --priority) priority="$2"; shift 2 ;;
+            --category) category="$2"; shift 2 ;;
+            --tag)      tag="$2"; shift 2 ;;
+            --type)     type="$2"; shift 2 ;;
+            --status)   status="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    local where="WHERE r.status='${status}'"
+    [[ -n "$module" ]]   && where="${where} AND m.name='$(echo "$module" | sed "s/'/''/g")'"
+    [[ -n "$priority" ]] && where="${where} AND r.priority='${priority}'"
+    [[ -n "$category" ]] && where="${where} AND r.category='${category}'"
+    [[ -n "$type" ]]     && where="${where} AND r.type='${type}'"
+
+    local join=""
+    if [[ -n "$tag" ]]; then
+        join="JOIN requirement_tags rt ON rt.requirement_id = r.id"
+        where="${where} AND rt.tag='$(echo "$tag" | sed "s/'/''/g")'"
+    fi
+
+    sql_table "SELECT
+        r.category || '-' || printf('%03d', r.seq) AS id,
+        m.name AS module,
+        r.priority,
+        r.type,
+        substr(r.summary, 1, 72) AS summary
+    FROM requirements r
+    JOIN modules m ON m.id = r.module_id
+    ${join}
+    ${where}
+    ORDER BY m.name, r.category, r.seq;"
+}
+
+# --- show -----------------------------------------------------------------
+# Show full detail for a single requirement including acceptance criteria,
+# tags, and dependencies.
+#
+# Usage: req show <display_id> [--module M] [--format yaml]
+#
+# Default output is a human-readable table. Use --format yaml to output
+# in the same YAML format used by import/export, suitable for round-tripping
+# with the update command.
+# --------------------------------------------------------------------------
+cmd_show() {
+    require_db
+    local display_id="${1:-}"
+    [[ -n "$display_id" ]] || die "Usage: req show <display_id> [--module M] [--format yaml]"
+    shift
+
+    local module="" format=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --module) module="$2"; shift 2 ;;
+            --format) format="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    local module_id
+    if [[ -n "$module" ]]; then
+        module_id=$(resolve_module "$module")
+    else
+        module_id=$(default_module_id)
+    fi
+
+    local rid
+    rid=$(resolve_requirement "$display_id" "$module_id")
+
+    if [[ "$format" == "yaml" ]]; then
+        cmd_show_yaml "$rid" "$display_id"
+        return
+    fi
+
+    echo ""
+    sql_table "SELECT
+        r.category || '-' || printf('%03d', r.seq) AS id,
+        m.name AS module,
+        r.type,
+        r.priority,
+        r.status,
+        r.summary,
+        r.detail,
+        r.created_at,
+        r.updated_at
+    FROM requirements r
+    JOIN modules m ON m.id = r.module_id
+    WHERE r.id = ${rid};"
+
+    echo ""
+    echo "Acceptance Criteria:"
+    sql "SELECT '  - ' || criterion FROM acceptance WHERE requirement_id=${rid} ORDER BY sort_order;"
+
+    local tag_list
+    tag_list=$(sql "SELECT group_concat(tag, ', ') FROM requirement_tags WHERE requirement_id=${rid} AND tag NOT LIKE 'depends:%';")
+    [[ -n "$tag_list" ]] && echo "" && echo "Tags: ${tag_list}"
+
+    local dep_list
+    dep_list=$(sql "SELECT group_concat(
+        r2.category || '-' || printf('%03d', r2.seq), ', ')
+        FROM requirement_depends rd
+        JOIN requirements r2 ON r2.id = rd.depends_on_id
+        WHERE rd.requirement_id=${rid};")
+    [[ -n "$dep_list" ]] && echo "Depends: ${dep_list}"
+
+    echo ""
+}
+
+# Output a single requirement as YAML (reuses export format).
+# Usage: cmd_show_yaml <internal_rid> <display_id>
+cmd_show_yaml() {
+    local rid="$1"
+    local display_id="$2"
+
+    local type_val pri summ det
+    IFS=$'\t' read -r type_val pri summ det < <(sql_tsv "SELECT
+        r.type, r.priority, r.summary, COALESCE(r.detail, '')
+    FROM requirements r WHERE r.id = ${rid};")
+
+    echo "- id: ${display_id}"
+    echo "  type: ${type_val}"
+    echo "  priority: ${pri}"
+    echo "  summary: ${summ}"
+    [[ -n "$det" ]] && echo "  detail: >" && echo "    ${det}"
+
+    local criteria
+    criteria=$(sql "SELECT criterion FROM acceptance WHERE requirement_id=${rid} ORDER BY sort_order;")
+    if [[ -n "$criteria" ]]; then
+        echo "  accepts:"
+        while IFS= read -r crit; do
+            echo "    - ${crit}"
+        done <<< "$criteria"
+    fi
+
+    local deps
+    deps=$(sql "SELECT r2.category || '-' || printf('%03d', r2.seq)
+                FROM requirement_depends rd
+                JOIN requirements r2 ON r2.id = rd.depends_on_id
+                WHERE rd.requirement_id=${rid};")
+    if [[ -n "$deps" ]]; then
+        local dep_csv
+        dep_csv=$(echo "$deps" | tr '\n' ',' | sed 's/,$//')
+        echo "  depends: [${dep_csv}]"
+    fi
+
+    local tag_list
+    tag_list=$(sql "SELECT tag FROM requirement_tags WHERE requirement_id=${rid} AND tag NOT LIKE 'depends:%' ORDER BY tag;")
+    if [[ -n "$tag_list" ]]; then
+        local tags_csv
+        tags_csv=$(echo "$tag_list" | tr '\n' ',' | sed 's/,$//')
+        echo "  tags: [${tags_csv}]"
+    fi
+}
+
+# --- edit -----------------------------------------------------------------
+# Update a single field on a requirement.
+#
+# Usage: req edit <display_id> <field> <value> [--module M]
+#
+# Editable fields: type, priority, summary, detail, status
+# --------------------------------------------------------------------------
+cmd_edit() {
+    require_db
+    local display_id="${1:-}"
+    local field="${2:-}"
+    local value="${3:-}"
+    [[ -n "$display_id" && -n "$field" && -n "$value" ]] || die "Usage: req edit <display_id> <field> <value> [--module M]"
+    shift 3
+
+    local module=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --module) module="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    local module_id
+    if [[ -n "$module" ]]; then
+        module_id=$(resolve_module "$module")
+    else
+        module_id=$(default_module_id)
+    fi
+
+    local rid
+    rid=$(resolve_requirement "$display_id" "$module_id")
+
+    case "$field" in
+        type)     validate_in "$value" "${VALID_TYPES[@]}" ;;
+        priority) validate_in "$value" "${VALID_PRIORITIES[@]}" ;;
+        status)   validate_in "$value" "${VALID_STATUSES[@]}" ;;
+        summary|detail) ;;
+        *) die "Editable fields: type, priority, summary, detail, status" ;;
+    esac
+
+    sql "UPDATE requirements SET ${field}='$(echo "$value" | sed "s/'/''/g")', updated_at=datetime('now') WHERE id=${rid};"
+    info "Updated ${display_id} ${field} → ${value}"
+}
+
+# --- update ---------------------------------------------------------------
+# Update a requirement from YAML on stdin. Replaces all fields present in the
+# YAML; fields omitted from the input are left unchanged. Supports all fields
+# including acceptance criteria, tags, and dependencies.
+#
+# Usage: echo '<yaml>' | req update <display_id> [--module M]
+#        req update <display_id> [--module M] <<'EOF'
+#        - id: AUTH-005
+#          summary: New summary
+#          accepts:
+#            - Criterion one
+#            - Criterion two
+#        EOF
+#
+# The `- id:` line in the YAML is optional (the display_id argument identifies
+# the target). If present, it is validated but not used for lookup.
+# --------------------------------------------------------------------------
+cmd_update() {
+    require_db
+    local display_id="${1:-}"
+    [[ -n "$display_id" ]] || die "Usage: req update <display_id> [--module M] < yaml"
+    shift
+
+    local module=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --module) module="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    local module_id
+    if [[ -n "$module" ]]; then
+        module_id=$(resolve_module "$module")
+    else
+        module_id=$(default_module_id)
+    fi
+
+    local rid
+    rid=$(resolve_requirement "$display_id" "$module_id")
+
+    # Parse YAML from stdin
+    local type="" priority="" summary="" detail=""
+    local has_accepts=false has_tags=false has_depends=false
+    local in_accepts=false in_detail=false
+    local -a accepts=()
+    local -a tags=()
+    local -a depends=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && { in_detail=false; continue; }
+
+        # Skip the id line (validated only)
+        if [[ "$line" =~ ^-[[:space:]]+id:[[:space:]]*([A-Z]+-[0-9]+) ]]; then
+            local yaml_id="${BASH_REMATCH[1]}"
+            if [[ "$yaml_id" != "$display_id" ]]; then
+                warn "YAML id '${yaml_id}' does not match target '${display_id}' (ignored)"
+            fi
+            continue
+        fi
+
+        # Acceptance criteria items
+        if $in_accepts && [[ "$line" =~ ^[[:space:]]+-[[:space:]]+(.*) ]]; then
+            accepts+=("${BASH_REMATCH[1]}")
+            continue
+        elif $in_accepts && [[ ! "$line" =~ ^[[:space:]]+- ]]; then
+            in_accepts=false
+        fi
+
+        # Multi-line detail continuation
+        if $in_detail && [[ "$line" =~ ^[[:space:]]{4,} ]]; then
+            local trimmed
+            trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
+            detail="${detail} ${trimmed}"
+            continue
+        elif $in_detail; then
+            in_detail=false
+        fi
+
+        # Field parsing
+        if [[ "$line" =~ ^[[:space:]]+type:[[:space:]]*(.*) ]]; then
+            type="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+priority:[[:space:]]*(.*) ]]; then
+            priority="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+summary:[[:space:]]*(.*) ]]; then
+            summary="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+detail:[[:space:]]*\> ]]; then
+            in_detail=true
+            detail=""
+        elif [[ "$line" =~ ^[[:space:]]+detail:[[:space:]]*(.*) ]]; then
+            detail="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+accepts: ]]; then
+            in_accepts=true
+            has_accepts=true
+            in_detail=false
+        elif [[ "$line" =~ ^[[:space:]]+tags:[[:space:]]*\[(.*)\] ]]; then
+            has_tags=true
+            IFS=',' read -ra raw_tags <<< "${BASH_REMATCH[1]}"
+            for t in "${raw_tags[@]}"; do
+                t=$(echo "$t" | xargs)
+                [[ -n "$t" ]] && tags+=("$t")
+            done
+        elif [[ "$line" =~ ^[[:space:]]+depends:[[:space:]]*\[(.*)\] ]]; then
+            has_depends=true
+            IFS=',' read -ra raw_deps <<< "${BASH_REMATCH[1]}"
+            for d in "${raw_deps[@]}"; do
+                d=$(echo "$d" | xargs)
+                [[ -n "$d" ]] && depends+=("$d")
+            done
+        fi
+    done
+
+    # Build UPDATE SET clause for scalar fields (only those present)
+    local sets=""
+    if [[ -n "$type" ]]; then
+        validate_in "$type" "${VALID_TYPES[@]}"
+        sets="${sets}type='${type}', "
+    fi
+    if [[ -n "$priority" ]]; then
+        validate_in "$priority" "${VALID_PRIORITIES[@]}"
+        sets="${sets}priority='${priority}', "
+    fi
+    if [[ -n "$summary" ]]; then
+        sets="${sets}summary='$(echo "$summary" | sed "s/'/''/g")', "
+    fi
+    if [[ -n "$detail" ]]; then
+        sets="${sets}detail='$(echo "$detail" | sed "s/'/''/g")', "
+    fi
+
+    # Update scalar fields
+    if [[ -n "$sets" ]]; then
+        sets="${sets}updated_at=datetime('now')"
+        sql "UPDATE requirements SET ${sets} WHERE id=${rid};"
+    fi
+
+    # Update acceptance criteria (replace all when accepts: key was present)
+    if $has_accepts; then
+        sql "DELETE FROM acceptance WHERE requirement_id=${rid};"
+        local order=0
+        for ac in ${accepts[@]+"${accepts[@]}"}; do
+            sql "INSERT INTO acceptance (requirement_id, criterion, sort_order)
+                 VALUES (${rid}, '$(echo "$ac" | sed "s/'/''/g")', ${order});"
+            order=$((order + 1))
+        done
+    fi
+
+    # Update tags (replace non-depends tags when tags: key was present)
+    if $has_tags; then
+        sql "DELETE FROM requirement_tags WHERE requirement_id=${rid} AND tag NOT LIKE 'depends:%';"
+        for tag in ${tags[@]+"${tags[@]}"}; do
+            sql "INSERT OR IGNORE INTO requirement_tags (requirement_id, tag)
+                 VALUES (${rid}, '$(echo "$tag" | sed "s/'/''/g")');"
+        done
+    fi
+
+    # Update dependencies (replace all when depends: key was present)
+    if $has_depends; then
+        sql "DELETE FROM requirement_depends WHERE requirement_id=${rid};"
+        for dep in ${depends[@]+"${depends[@]}"}; do
+            local tid
+            tid=$(resolve_requirement "$dep" "$module_id")
+            sql "INSERT OR IGNORE INTO requirement_depends (requirement_id, depends_on_id)
+                 VALUES (${rid}, ${tid});"
+        done
+    fi
+
+    # Touch updated_at even if only sub-tables changed
+    if [[ -z "$sets" ]] && ($has_accepts || $has_tags || $has_depends); then
+        sql "UPDATE requirements SET updated_at=datetime('now') WHERE id=${rid};"
+    fi
+
+    info "Updated ${display_id}"
+}
+
+# --- tag ------------------------------------------------------------------
+# Add or remove tags on a requirement.
+#
+# Usage: req tag <display_id> add|rm <tag> [--module M]
+# --------------------------------------------------------------------------
+cmd_tag() {
+    require_db
+    local display_id="${1:-}"
+    local action="${2:-}"
+    local tag="${3:-}"
+    [[ -n "$display_id" && -n "$action" && -n "$tag" ]] || die "Usage: req tag <display_id> add|rm <tag> [--module M]"
+    shift 3
+
+    local module=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --module) module="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    local module_id
+    if [[ -n "$module" ]]; then
+        module_id=$(resolve_module "$module")
+    else
+        module_id=$(default_module_id)
+    fi
+
+    local rid
+    rid=$(resolve_requirement "$display_id" "$module_id")
+
+    case "$action" in
+        add) sql "INSERT OR IGNORE INTO requirement_tags (requirement_id, tag) VALUES (${rid}, '$(echo "$tag" | sed "s/'/''/g")');"
+             info "Tag '${tag}' added to ${display_id}" ;;
+        rm)  sql "DELETE FROM requirement_tags WHERE requirement_id=${rid} AND tag='$(echo "$tag" | sed "s/'/''/g")';"
+             info "Tag '${tag}' removed from ${display_id}" ;;
+        *)   die "Usage: req tag <display_id> add|rm <tag>" ;;
+    esac
+}
+
+# --- depend ---------------------------------------------------------------
+# Add or remove dependencies between requirements.
+#
+# Usage: req depend <display_id> add|rm <target_display_id> [--module M]
+# --------------------------------------------------------------------------
+cmd_depend() {
+    require_db
+    local display_id="${1:-}"
+    local action="${2:-}"
+    local target_id="${3:-}"
+    [[ -n "$display_id" && -n "$action" && -n "$target_id" ]] || die "Usage: req depend <display_id> add|rm <target_id> [--module M]"
+    shift 3
+
+    local module=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --module) module="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    local module_id
+    if [[ -n "$module" ]]; then
+        module_id=$(resolve_module "$module")
+    else
+        module_id=$(default_module_id)
+    fi
+
+    local rid tid
+    rid=$(resolve_requirement "$display_id" "$module_id")
+    tid=$(resolve_requirement "$target_id" "$module_id")
+
+    case "$action" in
+        add) sql "INSERT OR IGNORE INTO requirement_depends (requirement_id, depends_on_id) VALUES (${rid}, ${tid});"
+             info "${display_id} now depends on ${target_id}" ;;
+        rm)  sql "DELETE FROM requirement_depends WHERE requirement_id=${rid} AND depends_on_id=${tid};"
+             info "Dependency ${display_id} → ${target_id} removed" ;;
+        *)   die "Usage: req depend <display_id> add|rm <target_id>" ;;
+    esac
+}
+
+# --- rm -------------------------------------------------------------------
+# Soft-delete a requirement (sets status to 'deleted').
+#
+# Usage: req rm <display_id> [--module M]
+# --------------------------------------------------------------------------
+cmd_rm() {
+    require_db
+    local display_id="${1:-}"
+    [[ -n "$display_id" ]] || die "Usage: req rm <display_id> [--module M]"
+    shift
+
+    local module=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --module) module="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    local module_id
+    if [[ -n "$module" ]]; then
+        module_id=$(resolve_module "$module")
+    else
+        module_id=$(default_module_id)
+    fi
+
+    local rid
+    rid=$(resolve_requirement "$display_id" "$module_id")
+    sql "UPDATE requirements SET status='deleted', updated_at=datetime('now') WHERE id=${rid};"
+    info "Deleted ${display_id} (soft-delete; use --status deleted to see it)"
+}
+
+# --- purge ----------------------------------------------------------------
+# Permanently remove soft-deleted requirements older than N days.
+# This is the only operation that physically deletes rows.
+# CASCADE ensures acceptance criteria, tags, and dependencies are removed too.
+#
+# Usage: req purge <days>
+# --------------------------------------------------------------------------
+cmd_purge() {
+    require_db
+    local days="${1:-}"
+    [[ -n "$days" ]] || die "Usage: req purge <days>"
+    [[ "$days" =~ ^[0-9]+$ ]] || die "Days must be a positive integer."
+    [[ "$days" -gt 0 ]] || die "Days must be greater than zero."
+
+    local cutoff
+    cutoff=$(sql "SELECT datetime('now', '-${days} days');")
+
+    local purge_count
+    purge_count=$(sql "SELECT COUNT(*) FROM requirements WHERE status='deleted' AND updated_at < '${cutoff}';")
+
+    if [[ "$purge_count" -eq 0 ]]; then
+        info "No soft-deleted requirements older than ${days} days."
+        return 0
+    fi
+
+    read -rp "Permanently remove ${purge_count} soft-deleted requirement(s) older than ${days} days? [y/N]: " confirm
+    [[ "$confirm" =~ ^[yY] ]] || { info "Aborted."; return 0; }
+
+    sql "DELETE FROM requirements WHERE status='deleted' AND updated_at < '${cutoff}';"
+    info "Purged ${purge_count} requirement(s)."
+}
+
+# --- export ---------------------------------------------------------------
+# Export requirements to YAML or CSV format.
+#
+# YAML output matches the requirements-extractor skill format, suitable for
+# re-import or for use as context in Claude conversations.
+#
+# Usage: req export [--module M] [--format yaml|csv] [--priority P]
+#                   [--category C] [--tag T] [--status S]
+# --------------------------------------------------------------------------
+cmd_export() {
+    require_db
+
+    local module="" priority="" category="" tag="" type="" status="active" format="yaml"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --module)   module="$2"; shift 2 ;;
+            --priority) priority="$2"; shift 2 ;;
+            --category) category="$2"; shift 2 ;;
+            --tag)      tag="$2"; shift 2 ;;
+            --type)     type="$2"; shift 2 ;;
+            --status)   status="$2"; shift 2 ;;
+            --format)   format="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    local where="WHERE r.status='${status}'"
+    [[ -n "$module" ]]   && where="${where} AND m.name='$(echo "$module" | sed "s/'/''/g")'"
+    [[ -n "$priority" ]] && where="${where} AND r.priority='${priority}'"
+    [[ -n "$category" ]] && where="${where} AND r.category='${category}'"
+    [[ -n "$type" ]]     && where="${where} AND r.type='${type}'"
+
+    local join=""
+    if [[ -n "$tag" ]]; then
+        join="JOIN requirement_tags rt ON rt.requirement_id = r.id"
+        where="${where} AND rt.tag='$(echo "$tag" | sed "s/'/''/g")'"
+    fi
+
+    if [[ "$format" == "csv" ]]; then
+        echo "id,module,category,type,priority,summary,detail,status"
+        sql_tsv "SELECT
+            r.category || '-' || printf('%03d', r.seq),
+            m.name,
+            r.category,
+            r.type,
+            r.priority,
+            '\"' || replace(r.summary, '\"', '\"\"') || '\"',
+            '\"' || replace(COALESCE(r.detail,''), '\"', '\"\"') || '\"',
+            r.status
+        FROM requirements r
+        JOIN modules m ON m.id = r.module_id
+        ${join}
+        ${where}
+        ORDER BY m.name, r.category, r.seq;" | tr '\t' ','
+        return
+    fi
+
+    # YAML export
+    local current_category=""
+    local prev_module=""
+
+    while IFS=$'\t' read -r rid display_id mod cat type_val pri summ det; do
+        if [[ "$mod" != "$prev_module" ]]; then
+            [[ -n "$prev_module" ]] && echo ""
+            echo "# === Module: ${mod} ==="
+            prev_module="$mod"
+            current_category=""
+        fi
+
+        if [[ "$cat" != "$current_category" ]]; then
+            echo ""
+            echo "# --- ${cat} ---"
+            current_category="$cat"
+        fi
+
+        echo ""
+        echo "- id: ${display_id}"
+        echo "  type: ${type_val}"
+        echo "  priority: ${pri}"
+        echo "  summary: ${summ}"
+        [[ -n "$det" ]] && echo "  detail: >" && echo "    ${det}"
+
+        # Acceptance criteria
+        local criteria
+        criteria=$(sql "SELECT criterion FROM acceptance WHERE requirement_id=${rid} ORDER BY sort_order;")
+        if [[ -n "$criteria" ]]; then
+            echo "  accepts:"
+            while IFS= read -r crit; do
+                echo "    - ${crit}"
+            done <<< "$criteria"
+        fi
+
+        # Dependencies
+        local deps
+        deps=$(sql "SELECT r2.category || '-' || printf('%03d', r2.seq)
+                    FROM requirement_depends rd
+                    JOIN requirements r2 ON r2.id = rd.depends_on_id
+                    WHERE rd.requirement_id=${rid};")
+        if [[ -n "$deps" ]]; then
+            local dep_list
+            dep_list=$(echo "$deps" | tr '\n' ',' | sed 's/,$//')
+            echo "  depends: [${dep_list}]"
+        fi
+
+        # Tags
+        local tag_list
+        tag_list=$(sql "SELECT tag FROM requirement_tags WHERE requirement_id=${rid} AND tag NOT LIKE 'depends:%' ORDER BY tag;")
+        if [[ -n "$tag_list" ]]; then
+            local tags_csv
+            tags_csv=$(echo "$tag_list" | tr '\n' ',' | sed 's/,$//')
+            echo "  tags: [${tags_csv}]"
+        fi
+
+    done < <(sql_tsv "SELECT
+        r.id,
+        r.category || '-' || printf('%03d', r.seq),
+        m.name,
+        r.category,
+        r.type,
+        r.priority,
+        r.summary,
+        COALESCE(r.detail, '')
+    FROM requirements r
+    JOIN modules m ON m.id = r.module_id
+    ${join}
+    ${where}
+    ORDER BY m.name, r.category, r.seq;")
+}
+
+# --- stats ----------------------------------------------------------------
+# Show summary statistics: counts by category, priority, and coverage.
+#
+# Usage: req stats [--module M]
+# --------------------------------------------------------------------------
+cmd_stats() {
+    require_db
+
+    local module=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --module) module="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    local where="WHERE r.status='active'"
+    [[ -n "$module" ]] && where="${where} AND m.name='$(echo "$module" | sed "s/'/''/g")'"
+
+    echo "=== Requirements Summary ==="
+    echo ""
+
+    echo "By Category:"
+    sql_table "SELECT r.category, COUNT(*) AS count
+        FROM requirements r JOIN modules m ON m.id = r.module_id
+        ${where}
+        GROUP BY r.category ORDER BY r.category;"
+
+    echo ""
+    echo "By Priority:"
+    sql_table "SELECT r.priority, COUNT(*) AS count
+        FROM requirements r JOIN modules m ON m.id = r.module_id
+        ${where}
+        GROUP BY r.priority ORDER BY
+            CASE r.priority WHEN 'must' THEN 1 WHEN 'should' THEN 2 WHEN 'could' THEN 3 WHEN 'wont' THEN 4 END;"
+
+    echo ""
+    echo "By Type:"
+    sql_table "SELECT r.type, COUNT(*) AS count
+        FROM requirements r JOIN modules m ON m.id = r.module_id
+        ${where}
+        GROUP BY r.type ORDER BY r.type;"
+
+    if [[ -z "$module" ]]; then
+        echo ""
+        echo "By Module:"
+        sql_table "SELECT m.name AS module, COUNT(*) AS count
+            FROM requirements r JOIN modules m ON m.id = r.module_id
+            ${where}
+            GROUP BY m.name ORDER BY m.name;"
+    fi
+
+    echo ""
+    local total
+    total=$(sql "SELECT COUNT(*) FROM requirements r JOIN modules m ON m.id = r.module_id ${where};")
+    info "Total active requirements: ${total}"
+}
+
+# --- check ----------------------------------------------------------------
+# Run quality checks against the requirements database.
+# Reports: missing acceptance criteria, empty categories, orphan deps.
+#
+# Usage: req check [--module M]
+# --------------------------------------------------------------------------
+cmd_check() {
+    require_db
+
+    local module=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --module) module="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    local where="WHERE r.status='active'"
+    [[ -n "$module" ]] && where="${where} AND m.name='$(echo "$module" | sed "s/'/''/g")'"
+
+    local issues=0
+
+    echo "=== Quality Check ==="
+    echo ""
+
+    # Missing acceptance criteria
+    echo "Requirements missing acceptance criteria:"
+    local missing
+    missing=$(sql_table "SELECT r.category || '-' || printf('%03d', r.seq) AS id, m.name AS module, substr(r.summary,1,60) AS summary
+        FROM requirements r
+        JOIN modules m ON m.id = r.module_id
+        LEFT JOIN acceptance a ON a.requirement_id = r.id
+        ${where} AND a.id IS NULL;")
+    if [[ -n "$missing" ]]; then
+        echo "$missing"
+        issues=$((issues + 1))
+    else
+        echo "  None — all requirements have acceptance criteria."
+    fi
+
+    echo ""
+
+    # Categories with no requirements
+    echo "Missing categories (no active requirements):"
+    local covered
+    covered=$(sql "SELECT DISTINCT r.category FROM requirements r JOIN modules m ON m.id = r.module_id ${where};")
+    local has_gap=false
+    for cat in "${VALID_CATEGORIES[@]}"; do
+        if ! echo "$covered" | grep -q "^${cat}$"; then
+            echo "  ${cat} — no requirements"
+            has_gap=true
+            issues=$((issues + 1))
+        fi
+    done
+    $has_gap || echo "  None — all categories covered."
+
+    echo ""
+
+    # Requirements with only 1 acceptance criterion (potential under-specification)
+    echo "Requirements with only 1 acceptance criterion:"
+    local thin
+    thin=$(sql_table "SELECT r.category || '-' || printf('%03d', r.seq) AS id, m.name AS module, COUNT(a.id) AS criteria
+        FROM requirements r
+        JOIN modules m ON m.id = r.module_id
+        JOIN acceptance a ON a.requirement_id = r.id
+        ${where}
+        GROUP BY r.id HAVING COUNT(a.id) = 1
+        ORDER BY m.name, r.category, r.seq;")
+    if [[ -n "$thin" ]]; then
+        echo "$thin"
+        issues=$((issues + 1))
+    else
+        echo "  None."
+    fi
+
+    echo ""
+    if [[ $issues -eq 0 ]]; then
+        info "✓ No issues found."
+    else
+        info "Found ${issues} issue(s) to review."
+    fi
+}
+
+# --- snapshot --------------------------------------------------------------
+# Export all modules to individual YAML files in specs/snapshots/.
+# These files are the git-versioned source of truth for requirements.
+# The database (requirements.db) is a working copy and should be gitignored.
+#
+# Writes one file per module: specs/snapshots/<module-name>.yaml
+# Also writes specs/snapshots/modules.yaml with module metadata.
+#
+# Usage: req snapshot
+#
+# Designed to be called from a git pre-commit hook so snapshots are always
+# in sync with the database at commit time.
+# --------------------------------------------------------------------------
+cmd_snapshot() {
+    require_db
+    mkdir -p "$SNAPSHOT_DIR"
+
+    # Export module metadata
+    local module_count=0
+    local modules_file="${SNAPSHOT_DIR}/modules.yaml"
+    echo "# Module registry — auto-generated by 'req snapshot'" > "$modules_file"
+    echo "# Do not edit manually. Use 'req module add' then 'req snapshot'." >> "$modules_file"
+    echo "" >> "$modules_file"
+
+    while IFS=$'\t' read -r name desc; do
+        echo "- name: ${name}" >> "$modules_file"
+        [[ -n "$desc" ]] && echo "  description: ${desc}" >> "$modules_file"
+        module_count=$((module_count + 1))
+    done < <(sql_tsv "SELECT name, COALESCE(description,'') FROM modules ORDER BY name;")
+
+    # Export each module's requirements
+    local req_count=0
+    while IFS= read -r module_name; do
+        local outfile="${SNAPSHOT_DIR}/${module_name}.yaml"
+
+        # Write header
+        echo "# Requirements for module: ${module_name}" > "$outfile"
+        echo "# Auto-generated by 'req snapshot'. Do not edit manually." >> "$outfile"
+        echo "# Use 'req add', 'req edit', 'req import' then 'req snapshot'." >> "$outfile"
+
+        local current_category=""
+        local file_reqs=0
+
+        while IFS=$'\t' read -r rid display_id cat type_val pri summ det status; do
+            [[ "$det" == "<NONE>" ]] && det=""
+            if [[ "$cat" != "$current_category" ]]; then
+                echo "" >> "$outfile"
+                echo "# --- ${cat} ---" >> "$outfile"
+                current_category="$cat"
+            fi
+
+            echo "" >> "$outfile"
+            echo "- id: ${display_id}" >> "$outfile"
+            echo "  type: ${type_val}" >> "$outfile"
+            echo "  priority: ${pri}" >> "$outfile"
+            echo "  status: ${status}" >> "$outfile"
+            echo "  summary: ${summ}" >> "$outfile"
+            [[ -n "$det" ]] && echo "  detail: >" >> "$outfile" && echo "    ${det}" >> "$outfile"
+
+            # Acceptance criteria
+            local criteria
+            criteria=$(sql "SELECT criterion FROM acceptance WHERE requirement_id=${rid} ORDER BY sort_order;")
+            if [[ -n "$criteria" ]]; then
+                echo "  accepts:" >> "$outfile"
+                while IFS= read -r crit; do
+                    echo "    - ${crit}" >> "$outfile"
+                done <<< "$criteria"
+            fi
+
+            # Dependencies
+            local deps
+            deps=$(sql "SELECT r2.category || '-' || printf('%03d', r2.seq)
+                        FROM requirement_depends rd
+                        JOIN requirements r2 ON r2.id = rd.depends_on_id
+                        WHERE rd.requirement_id=${rid};")
+            if [[ -n "$deps" ]]; then
+                local dep_list
+                dep_list=$(echo "$deps" | tr '\n' ',' | sed 's/,$//')
+                echo "  depends: [${dep_list}]" >> "$outfile"
+            fi
+
+            # Tags
+            local tag_list
+            tag_list=$(sql "SELECT tag FROM requirement_tags WHERE requirement_id=${rid} AND tag NOT LIKE 'depends:%' ORDER BY tag;")
+            if [[ -n "$tag_list" ]]; then
+                local tags_csv
+                tags_csv=$(echo "$tag_list" | tr '\n' ',' | sed 's/,$//')
+                echo "  tags: [${tags_csv}]" >> "$outfile"
+            fi
+
+            req_count=$((req_count + 1))
+            file_reqs=$((file_reqs + 1))
+        done < <(sql_tsv "SELECT
+            r.id,
+            r.category || '-' || printf('%03d', r.seq),
+            r.category,
+            r.type,
+            r.priority,
+            r.summary,
+            CASE WHEN r.detail IS NULL OR r.detail = '' THEN '<NONE>' ELSE r.detail END,
+            r.status
+        FROM requirements r
+        JOIN modules m ON m.id = r.module_id
+        WHERE m.name='$(echo "$module_name" | sed "s/'/''/g")'
+        ORDER BY r.category, r.seq;")
+
+        info "  ${outfile##*/}: ${file_reqs} requirements"
+    done < <(sql "SELECT name FROM modules ORDER BY name;")
+
+    info ""
+    info "Snapshot complete: ${module_count} module(s), ${req_count} requirement(s)"
+    info "Files written to ${SNAPSHOT_DIR}/"
+}
+
+# --- restore --------------------------------------------------------------
+# Rebuild the database from snapshot YAML files in specs/snapshots/.
+# Destroys and recreates the database. This is the inverse of snapshot.
+#
+# Reads:
+#   specs/snapshots/modules.yaml       — module definitions
+#   specs/snapshots/<module-name>.yaml  — requirements per module
+#
+# Usage: req restore
+#
+# Use this after cloning a repo, or to reset the database to match git.
+# --------------------------------------------------------------------------
+cmd_restore() {
+    [[ -d "$SNAPSHOT_DIR" ]] || die "No snapshots directory found at ${SNAPSHOT_DIR}"
+    [[ -f "${SNAPSHOT_DIR}/modules.yaml" ]] || die "No modules.yaml found in ${SNAPSHOT_DIR}"
+    [[ -f "$SCHEMA_PATH" ]] || die "Schema not found at ${SCHEMA_PATH}"
+
+    # Verify: scan for duplicate IDs within each module YAML
+    local verify_errors=0
+    for vf in "${SNAPSHOT_DIR}"/*.yaml; do
+        local vf_base="${vf##*/}"
+        [[ "$vf_base" == "modules.yaml" ]] && continue
+        local vf_module="${vf_base%.yaml}"
+
+        local -a seen_ids=()
+        while IFS= read -r vline; do
+            if [[ "$vline" =~ ^-[[:space:]]+id:[[:space:]]*([A-Z]+-[0-9]+) ]]; then
+                local vid="${BASH_REMATCH[1]}"
+                local dup=false
+                for sid in ${seen_ids[@]+"${seen_ids[@]}"}; do
+                    if [[ "$sid" == "$vid" ]]; then
+                        dup=true
+                        break
+                    fi
+                done
+                if $dup; then
+                    warn "Duplicate ID '${vid}' in ${vf_base} (module: ${vf_module})"
+                    verify_errors=$((verify_errors + 1))
+                else
+                    seen_ids+=("$vid")
+                fi
+            fi
+        done < "$vf"
+    done
+
+    if [[ "$verify_errors" -gt 0 ]]; then
+        die "Found ${verify_errors} duplicate ID(s) in snapshot files. Fix the YAML before restoring."
+    fi
+
+    # Confirm destructive operation
+    if [[ -f "$DB_PATH" ]]; then
+        local count
+        count=$(sql "SELECT COUNT(*) FROM requirements;" 2>/dev/null || echo "0")
+        if [[ "$count" -gt 0 ]]; then
+            read -rp "This will destroy the current database (${count} requirements). Continue? [y/N]: " confirm
+            [[ "$confirm" =~ ^[yY] ]] || { info "Aborted."; return 0; }
+        fi
+        rm -f "$DB_PATH" "${DB_PATH}-wal" "${DB_PATH}-shm"
+    fi
+
+    # Recreate database
+    sqlite3 "$DB_PATH" < "$SCHEMA_PATH"
+    info "Database recreated."
+
+    # Restore modules
+    local module_count=0
+    local name="" desc=""
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+
+        if [[ "$line" =~ ^-[[:space:]]+name:[[:space:]]*(.*) ]]; then
+            # Flush previous module
+            if [[ -n "$name" ]]; then
+                sql "INSERT INTO modules (name, description) VALUES ('$(echo "$name" | sed "s/'/''/g")', '$(echo "$desc" | sed "s/'/''/g")');"
+                module_count=$((module_count + 1))
+            fi
+            name="${BASH_REMATCH[1]}"
+            desc=""
+        elif [[ "$line" =~ ^[[:space:]]+description:[[:space:]]*(.*) ]]; then
+            desc="${BASH_REMATCH[1]}"
+        fi
+    done < "${SNAPSHOT_DIR}/modules.yaml"
+
+    # Flush last module
+    if [[ -n "$name" ]]; then
+        sql "INSERT INTO modules (name, description) VALUES ('$(echo "$name" | sed "s/'/''/g")', '$(echo "$desc" | sed "s/'/''/g")');"
+        module_count=$((module_count + 1))
+    fi
+    info "Restored ${module_count} module(s)."
+
+    # Restore requirements from each module YAML
+    local total_reqs=0
+    for yaml_file in "${SNAPSHOT_DIR}"/*.yaml; do
+        local basename="${yaml_file##*/}"
+        [[ "$basename" == "modules.yaml" ]] && continue
+
+        local module_name="${basename%.yaml}"
+        local module_id
+        module_id=$(sql "SELECT id FROM modules WHERE name='$(echo "$module_name" | sed "s/'/''/g")';")
+
+        if [[ -z "$module_id" ]]; then
+            warn "Module '${module_name}' not in modules.yaml, skipping ${basename}"
+            continue
+        fi
+
+        # Use the existing import parser but with status support
+        local in_req=false
+        local in_accepts=false
+        local in_detail=false
+        local category="" seq="" type="" priority="" summary="" detail="" status=""
+        local -a accepts=()
+        local -a tags=()
+        local -a depends=()
+        local file_reqs=0
+
+        restore_flush() {
+            [[ -n "$category" && -n "$summary" ]] || return 0
+
+            # Use seq from YAML id if present, otherwise auto-assign
+            local use_seq
+            if [[ -n "$seq" ]]; then
+                use_seq=$((10#$seq))
+            else
+                use_seq=$(next_seq "$module_id" "$category")
+            fi
+            type="${type:-functional}"
+            priority="${priority:-should}"
+            status="${status:-active}"
+
+            local rid
+            rid=$(sql "INSERT INTO requirements (module_id, category, seq, type, priority, summary, detail, status)
+                 VALUES (${module_id}, '${category}', ${use_seq}, '${type}', '${priority}',
+                         '$(echo "$summary" | sed "s/'/''/g")',
+                         '$(echo "$detail" | sed "s/'/''/g")',
+                         '${status}');
+                 SELECT last_insert_rowid();")
+
+            local order=0
+            for ac in ${accepts[@]+"${accepts[@]}"}; do
+                sql "INSERT INTO acceptance (requirement_id, criterion, sort_order)
+                     VALUES (${rid}, '$(echo "$ac" | sed "s/'/''/g")', ${order});"
+                order=$((order + 1))
+            done
+
+            for tag in ${tags[@]+"${tags[@]}"}; do
+                sql "INSERT OR IGNORE INTO requirement_tags (requirement_id, tag)
+                     VALUES (${rid}, '$(echo "$tag" | sed "s/'/''/g")');"
+            done
+
+            for dep in ${depends[@]+"${depends[@]}"}; do
+                sql "INSERT OR IGNORE INTO requirement_tags (requirement_id, tag)
+                     VALUES (${rid}, 'depends:$(echo "$dep" | sed "s/'/''/g")');"
+            done
+
+            file_reqs=$((file_reqs + 1))
+            total_reqs=$((total_reqs + 1))
+
+            category="" seq="" type="" priority="" summary="" detail="" status=""
+            accepts=() tags=() depends=()
+            in_accepts=false in_detail=false
+        }
+
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ "$line" =~ ^[[:space:]]*$ ]] && { in_detail=false; continue; }
+
+            if [[ "$line" =~ ^-[[:space:]]+id:[[:space:]]*([A-Z]+)-([0-9]+) ]]; then
+                restore_flush
+                in_req=true
+                in_accepts=false; in_detail=false
+                category="${BASH_REMATCH[1]}"
+                seq="${BASH_REMATCH[2]}"
+                continue
+            fi
+
+            $in_req || continue
+
+            if $in_accepts && [[ "$line" =~ ^[[:space:]]+-[[:space:]]+(.*) ]]; then
+                accepts+=("${BASH_REMATCH[1]}")
+                continue
+            elif $in_accepts && [[ ! "$line" =~ ^[[:space:]]+- ]]; then
+                in_accepts=false
+            fi
+
+            if $in_detail && [[ "$line" =~ ^[[:space:]]{4,} ]]; then
+                local trimmed
+                trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
+                detail="${detail} ${trimmed}"
+                continue
+            elif $in_detail; then
+                in_detail=false
+            fi
+
+            if [[ "$line" =~ ^[[:space:]]+type:[[:space:]]*(.*) ]]; then
+                type="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+priority:[[:space:]]*(.*) ]]; then
+                priority="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+status:[[:space:]]*(.*) ]]; then
+                status="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+summary:[[:space:]]*(.*) ]]; then
+                summary="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+detail:[[:space:]]*\> ]]; then
+                in_detail=true; detail=""
+            elif [[ "$line" =~ ^[[:space:]]+detail:[[:space:]]*(.*) ]]; then
+                detail="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+accepts: ]]; then
+                in_accepts=true; in_detail=false
+            elif [[ "$line" =~ ^[[:space:]]+tags:[[:space:]]*\[(.*)\] ]]; then
+                IFS=',' read -ra raw_tags <<< "${BASH_REMATCH[1]}"
+                for t in "${raw_tags[@]}"; do
+                    t=$(echo "$t" | xargs)
+                    [[ -n "$t" ]] && tags+=("$t")
+                done
+            elif [[ "$line" =~ ^[[:space:]]+depends:[[:space:]]*\[(.*)\] ]]; then
+                IFS=',' read -ra raw_deps <<< "${BASH_REMATCH[1]}"
+                for d in "${raw_deps[@]}"; do
+                    d=$(echo "$d" | xargs)
+                    [[ -n "$d" ]] && depends+=("$d")
+                done
+            fi
+        done < "$yaml_file"
+
+        restore_flush
+        info "  ${basename}: ${file_reqs} requirements"
+    done
+
+    info ""
+    info "Restore complete: ${module_count} module(s), ${total_reqs} requirement(s)"
+}
+
+# --- help -----------------------------------------------------------------
+cmd_help() {
+    sed -n '5,/^# =====/{/^# =====/d; s/^# \{0,1\}//; p;}' "${BASH_SOURCE[0]}"
+}
+
+# ---------------------------------------------------------------------------
+# Main dispatcher
+# ---------------------------------------------------------------------------
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        init)    cmd_init "$@" ;;
+        module)  cmd_module "$@" ;;
+        add)     cmd_add "$@" ;;
+        import)  cmd_import "$@" ;;
+        list)    cmd_list "$@" ;;
+        show)    cmd_show "$@" ;;
+        edit)    cmd_edit "$@" ;;
+        update)  cmd_update "$@" ;;
+        tag)     cmd_tag "$@" ;;
+        depend)  cmd_depend "$@" ;;
+        rm)      cmd_rm "$@" ;;
+        purge)   cmd_purge "$@" ;;
+        export)  cmd_export "$@" ;;
+        snapshot) cmd_snapshot "$@" ;;
+        restore) cmd_restore "$@" ;;
+        stats)   cmd_stats "$@" ;;
+        check)   cmd_check "$@" ;;
+        help|-h|--help) cmd_help ;;
+        *)       die "Unknown command: ${cmd}. Run 'req help' for usage." ;;
+    esac
+}
+
+main "$@"
