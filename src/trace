@@ -1,0 +1,484 @@
+#!/usr/bin/env bash
+# =============================================================================
+# trace — Requirements Traceability CLI
+# =============================================================================
+#
+# Scans Java source files for @requirements javadoc tags and cross-references
+# them with the requirements database managed by specs/req.
+#
+# LOCATION:
+#   specs/trace            — this script
+#   specs/requirements.db  — SQLite database (shared with specs/req)
+#
+# USAGE:
+#   trace <command> [options]
+#
+# COMMANDS:
+#   scan                          Scan Java files for @requirements tags (TSV output)
+#   map [--req ID]                Show code locations grouped by requirement
+#   coverage                      Cross-reference tags with database
+#   orphans                       Find tags referencing non-existent requirements
+#   summary                       Combined coverage + orphans report
+#   help                          Show this help
+#
+# EXAMPLES:
+#   trace scan
+#   trace map
+#   trace map --req AUTH-001
+#   trace coverage
+#   trace orphans
+#   trace summary
+#
+# TAG FORMAT (in javadoc):
+#   @requirements AUTH-001, AUTH-003, AUTH-010
+#
+# SCOPE RULES:
+#   Files in src/test/ or src/it/  →  scope = "tests"
+#   All other files                →  scope = "implements"
+#
+# DEPENDENCIES:
+#   - bash 4+
+#   - grep
+#   - sqlite3 (for database cross-reference commands only)
+#
+# =============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DB_PATH="${SCRIPT_DIR}/requirements.db"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+info() { echo "$*"; }
+
+require_db() {
+    [[ -f "$DB_PATH" ]] || die "Database not found. Run 'specs/req restore' or 'specs/req init' first."
+}
+
+sql() {
+    if [[ $# -gt 0 ]]; then
+        sqlite3 -batch "$DB_PATH" "$1"
+    else
+        sqlite3 -batch "$DB_PATH"
+    fi
+}
+
+sql_tsv() {
+    sqlite3 -batch -separator $'\t' "$DB_PATH" "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Core: scan Java files for @requirements tags
+# ---------------------------------------------------------------------------
+
+# Populates the SCAN_RESULTS array with TSV lines:
+#   REQ_ID<TAB>SCOPE<TAB>FILE<TAB>LINE<TAB>ELEMENT
+#
+# Uses grep to find @requirements lines, then parses IDs and resolves the
+# enclosing class or method name.
+do_scan() {
+    SCAN_RESULTS=()
+
+    local grep_output
+    grep_output=$(grep -rn "@requirements" --include="*.java" \
+        --exclude-dir=target --exclude-dir=target-ide --exclude-dir=build --exclude-dir=.git --exclude-dir=node_modules \
+        "$PROJECT_DIR" 2>/dev/null) || true
+
+    [[ -z "$grep_output" ]] && return
+
+    while IFS= read -r line; do
+        local file lineno content
+        # Format: /absolute/path/File.java:42: * @requirements AUTH-001, AUTH-002
+        file="${line%%:*}"
+        local rest="${line#*:}"
+        lineno="${rest%%:*}"
+        content="${rest#*:}"
+
+        # Extract requirement IDs from this line
+        # Strip everything before @requirements, then parse IDs
+        local ids_text="${content#*@requirements}"
+        # Also read continuation lines from the file
+        ids_text=$(collect_ids "$file" "$lineno" "$ids_text")
+
+        # Determine scope from file path
+        local scope="implements"
+        if [[ "$file" == */src/test/* ]] || [[ "$file" == */src/it/* ]]; then
+            scope="tests"
+        fi
+
+        # Relative path from project root
+        local rel_file="${file#"$PROJECT_DIR"/}"
+
+        # Find the element name (class or method) this javadoc is attached to
+        local element
+        element=$(find_element "$file" "$lineno")
+
+        # Parse comma-separated IDs
+        local id
+        while IFS= read -r id; do
+            [[ -n "$id" ]] && SCAN_RESULTS+=("${id}"$'\t'"${scope}"$'\t'"${rel_file}"$'\t'"${lineno}"$'\t'"${element}")
+        done < <(echo "$ids_text" | tr ',' '\n' | sed 's/^[ \t]*//;s/[ \t]*$//' | grep -E '^[A-Z]+-[0-9]+$')
+
+    done <<< "$grep_output"
+}
+
+# Collect requirement IDs from the @requirements line and any continuation lines.
+# Continuation lines are javadoc lines that contain only IDs (no other tag).
+collect_ids() {
+    local file="$1"
+    local start_line="$2"
+    local first_line_ids="$3"
+
+    local result="$first_line_ids"
+    local next_line=$((start_line + 1))
+    local total_lines
+    total_lines=$(wc -l < "$file")
+
+    while [[ $next_line -le $total_lines ]]; do
+        local next_content
+        next_content=$(sed -n "${next_line}p" "$file")
+
+        # Strip leading whitespace and javadoc prefix (* )
+        local stripped="${next_content#"${next_content%%[! ]*}"}"
+        stripped="${stripped#\*}"
+        stripped="${stripped#" "}"
+
+        # If the line contains another @tag or closes javadoc, stop
+        if [[ "$stripped" == *"@"* ]] || [[ "$stripped" == *"*/"* ]]; then
+            break
+        fi
+
+        # If the line contains requirement IDs (CAPS-DIGITS pattern), append
+        if echo "$stripped" | grep -qE '[A-Z]+-[0-9]+'; then
+            result="${result}, ${stripped}"
+        else
+            break
+        fi
+
+        next_line=$((next_line + 1))
+    done
+
+    echo "$result"
+}
+
+# Find the class or method name that the javadoc at the given line is attached to.
+# Scans forward from the tag line to find the closing */ then the next declaration.
+find_element() {
+    local file="$1"
+    local tag_line="$2"
+    local total_lines
+    total_lines=$(wc -l < "$file")
+
+    # First, find the closing */
+    local n=$((tag_line))
+    local found_close=false
+    while [[ $n -le $total_lines ]]; do
+        local line_content
+        line_content=$(sed -n "${n}p" "$file")
+        if [[ "$line_content" == *"*/"* ]]; then
+            found_close=true
+            n=$((n + 1))
+            break
+        fi
+        n=$((n + 1))
+    done
+
+    if ! $found_close; then
+        echo "(unknown)"
+        return
+    fi
+
+    # Now scan forward for the next class, interface, enum, or method declaration
+    while [[ $n -le $total_lines ]] && [[ $n -le $((tag_line + 30)) ]]; do
+        local line_content
+        line_content=$(sed -n "${n}p" "$file")
+
+        # Skip annotations and blank lines
+        local stripped="${line_content#"${line_content%%[! ]*}"}"
+        if [[ -z "$stripped" ]] || [[ "$stripped" == @* ]]; then
+            n=$((n + 1))
+            continue
+        fi
+
+        # Try to match class/interface/enum declaration
+        local name
+        name=$(echo "$line_content" | sed -En 's/.*(class|interface|enum|record) +([A-Za-z_][A-Za-z0-9_]*).*/\2/p')
+        if [[ -n "$name" ]]; then
+            echo "$name"
+            return
+        fi
+
+        # Try to match method declaration: look for word followed by (
+        name=$(echo "$line_content" | sed -En 's/.*[[:space:]]([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*\(.*/\1/p')
+        if [[ -n "$name" ]]; then
+            echo "$name"
+            return
+        fi
+
+        n=$((n + 1))
+    done
+
+    echo "(unknown)"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_scan() {
+    do_scan
+    if [[ ${#SCAN_RESULTS[@]} -eq 0 ]]; then
+        info "No @requirements tags found."
+        return
+    fi
+    printf "REQ_ID\tSCOPE\tFILE\tLINE\tELEMENT\n"
+    for row in "${SCAN_RESULTS[@]}"; do
+        printf "%s\n" "$row"
+    done
+}
+
+cmd_map() {
+    local filter_req=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --req) filter_req="$2"; shift 2 ;;
+            *)     die "Unknown option: $1" ;;
+        esac
+    done
+
+    do_scan
+
+    if [[ ${#SCAN_RESULTS[@]} -eq 0 ]]; then
+        info "No @requirements tags found."
+        return
+    fi
+
+    # Collect unique requirement IDs (sorted)
+    local req_ids
+    req_ids=$(for row in "${SCAN_RESULTS[@]}"; do echo "${row%%$'\t'*}"; done | sort -u)
+
+    if [[ -n "$filter_req" ]]; then
+        req_ids=$(echo "$req_ids" | grep -F "$filter_req" || true)
+        if [[ -z "$req_ids" ]]; then
+            info "No code references found for ${filter_req}."
+            return
+        fi
+    fi
+
+    while IFS= read -r req_id; do
+        [[ -z "$req_id" ]] && continue
+        info "${req_id}:"
+
+        # Collect implements entries
+        local has_impl=false
+        for row in "${SCAN_RESULTS[@]}"; do
+            local r_id r_scope r_file r_line r_elem
+            IFS=$'\t' read -r r_id r_scope r_file r_line r_elem <<< "$row"
+            if [[ "$r_id" == "$req_id" ]] && [[ "$r_scope" == "implements" ]]; then
+                if ! $has_impl; then
+                    info "  implements:"
+                    has_impl=true
+                fi
+                info "    ${r_file}:${r_line}  ${r_elem}"
+            fi
+        done
+        if ! $has_impl; then
+            info "  implements: (none)"
+        fi
+
+        # Collect tests entries
+        local has_tests=false
+        for row in "${SCAN_RESULTS[@]}"; do
+            local r_id r_scope r_file r_line r_elem
+            IFS=$'\t' read -r r_id r_scope r_file r_line r_elem <<< "$row"
+            if [[ "$r_id" == "$req_id" ]] && [[ "$r_scope" == "tests" ]]; then
+                if ! $has_tests; then
+                    info "  tests:"
+                    has_tests=true
+                fi
+                info "    ${r_file}:${r_line}  ${r_elem}"
+            fi
+        done
+        if ! $has_tests; then
+            info "  tests: (none)"
+        fi
+
+        info ""
+    done <<< "$req_ids"
+}
+
+cmd_coverage() {
+    require_db
+    do_scan
+
+    # Get all active requirement display IDs from the database
+    local db_reqs
+    db_reqs=$(sql_tsv "SELECT category || '-' || printf('%03d', seq), summary FROM requirements WHERE status='active' ORDER BY category, seq;")
+
+    local total=0
+    local covered_both=0
+    local covered_impl_only=0
+    local covered_test_only=0
+    local not_covered=0
+
+    local uncovered_lines=""
+    local impl_only_lines=""
+    local test_only_lines=""
+
+    # Build sets of scanned IDs by scope
+    local impl_ids=""
+    local test_ids=""
+    if [[ ${#SCAN_RESULTS[@]} -gt 0 ]]; then
+        impl_ids=$(for row in "${SCAN_RESULTS[@]}"; do
+            local r_id r_scope
+            IFS=$'\t' read -r r_id r_scope _ _ _ <<< "$row"
+            if [[ "$r_scope" == "implements" ]]; then echo "$r_id"; fi
+        done | sort -u) || true
+
+        test_ids=$(for row in "${SCAN_RESULTS[@]}"; do
+            local r_id r_scope
+            IFS=$'\t' read -r r_id r_scope _ _ _ <<< "$row"
+            if [[ "$r_scope" == "tests" ]]; then echo "$r_id"; fi
+        done | sort -u) || true
+    fi
+
+    while IFS=$'\t' read -r req_id summary; do
+        [[ -z "$req_id" ]] && continue
+        total=$((total + 1))
+
+        local has_impl=false
+        local has_test=false
+        if echo "$impl_ids" | grep -qxF "$req_id" 2>/dev/null; then has_impl=true; fi
+        if echo "$test_ids" | grep -qxF "$req_id" 2>/dev/null; then has_test=true; fi
+
+        if $has_impl && $has_test; then
+            covered_both=$((covered_both + 1))
+        elif $has_impl; then
+            covered_impl_only=$((covered_impl_only + 1))
+            impl_only_lines="${impl_only_lines}  ${req_id}  ${summary}\n"
+        elif $has_test; then
+            covered_test_only=$((covered_test_only + 1))
+            test_only_lines="${test_only_lines}  ${req_id}  ${summary}\n"
+        else
+            not_covered=$((not_covered + 1))
+            uncovered_lines="${uncovered_lines}  ${req_id}  ${summary}\n"
+        fi
+    done <<< "$db_reqs"
+
+    info "=== Requirements Coverage ==="
+    info ""
+    info "Covered (implementation + tests): ${covered_both}"
+    info "Covered (implementation only):    ${covered_impl_only}"
+    info "Covered (tests only):             ${covered_test_only}"
+    info "Not covered:                      ${not_covered}"
+    info "Total active requirements:        ${total}"
+
+    if [[ -n "$uncovered_lines" ]]; then
+        info ""
+        info "--- Not covered ---"
+        printf "%b" "$uncovered_lines"
+    fi
+
+    if [[ -n "$impl_only_lines" ]]; then
+        info ""
+        info "--- Implementation only (no tests) ---"
+        printf "%b" "$impl_only_lines"
+    fi
+
+    if [[ -n "$test_only_lines" ]]; then
+        info ""
+        info "--- Tests only (no implementation) ---"
+        printf "%b" "$test_only_lines"
+    fi
+}
+
+cmd_orphans() {
+    require_db
+    do_scan
+
+    if [[ ${#SCAN_RESULTS[@]} -eq 0 ]]; then
+        info "No @requirements tags found. Nothing to check."
+        return
+    fi
+
+    # Get unique IDs from scan
+    local scanned_ids
+    scanned_ids=$(for row in "${SCAN_RESULTS[@]}"; do echo "${row%%$'\t'*}"; done | sort -u)
+
+    local orphan_count=0
+    local output=""
+
+    while IFS= read -r req_id; do
+        [[ -z "$req_id" ]] && continue
+
+        # Parse category and seq
+        local category="${req_id%%-*}"
+        local seq="${req_id##*-}"
+        seq=$((10#$seq))
+
+        local exists
+        exists=$(sql "SELECT COUNT(*) FROM requirements WHERE category='${category}' AND seq=${seq} AND status='active';")
+
+        if [[ "$exists" -eq 0 ]]; then
+            orphan_count=$((orphan_count + 1))
+            output="${output}\n${req_id}  (not in database)\n"
+            for row in "${SCAN_RESULTS[@]}"; do
+                local r_id r_scope r_file r_line r_elem
+                IFS=$'\t' read -r r_id r_scope r_file r_line r_elem <<< "$row"
+                if [[ "$r_id" == "$req_id" ]]; then
+                    output="${output}  ${r_file}:${r_line}  ${r_elem}\n"
+                fi
+            done
+        fi
+    done <<< "$scanned_ids"
+
+    if [[ $orphan_count -eq 0 ]]; then
+        info "No orphaned references found. All @requirements tags reference valid requirements."
+    else
+        info "=== Orphan References (${orphan_count}) ==="
+        printf "%b" "$output"
+    fi
+}
+
+cmd_summary() {
+    require_db
+    cmd_coverage
+    info ""
+    info "---"
+    info ""
+    # Re-scan is avoided because do_scan was already called by cmd_coverage
+    # and SCAN_RESULTS is still populated. But cmd_orphans calls do_scan again.
+    # For simplicity, just call cmd_orphans which re-scans.
+    cmd_orphans
+}
+
+cmd_help() {
+    awk '/^# ===/{n++; next} n>=2 && n<3{sub(/^# ?/,""); print} n>=3{exit}' "$0"
+}
+
+# ---------------------------------------------------------------------------
+# Main dispatcher
+# ---------------------------------------------------------------------------
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        scan)     cmd_scan "$@" ;;
+        map)      cmd_map "$@" ;;
+        coverage) cmd_coverage "$@" ;;
+        orphans)  cmd_orphans "$@" ;;
+        summary)  cmd_summary "$@" ;;
+        help|-h|--help) cmd_help ;;
+        *)        die "Unknown command: ${cmd}. Run 'trace help' for usage." ;;
+    esac
+}
+
+main "$@"
