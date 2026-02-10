@@ -122,7 +122,7 @@ do_scan() {
         local id
         while IFS= read -r id; do
             [[ -n "$id" ]] && SCAN_RESULTS+=("${id}"$'\t'"${scope}"$'\t'"${rel_file}"$'\t'"${lineno}"$'\t'"${element}")
-        done < <(echo "$ids_text" | tr ',' '\n' | sed 's/^[ \t]*//;s/[ \t]*$//' | grep -E '^[A-Z]+-[0-9]+$')
+        done < <(echo "$ids_text" | tr -d '\r' | tr ',' '\n' | sed 's/^[ \t]*//;s/[ \t]*$//' | grep -E '^[A-Z]+-[0-9]+$')
 
     done <<< "$grep_output"
 }

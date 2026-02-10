@@ -39,7 +39,33 @@ first (the YAML snapshots in `specs/snapshots/` are the git-versioned source of 
 | Run quality checks | `specs/req check [--module M]` |
 | Export requirements | `specs/req export [filters...] [--format yaml\|csv]` |
 | List modules | `specs/req module list` |
+| Add (interactive) | `specs/req add [module]` |
+| Import from YAML file | `specs/req import [module] <file.yaml>` |
 | Snapshot for git | `specs/req snapshot` |
+| Restore from snapshots | `specs/req restore` |
+
+## Creating Requirements
+
+The `add` command is **interactive only** — it prompts for each field and cannot be used
+in non-interactive contexts (no `--batch` flag exists).
+
+To create requirements non-interactively, write a YAML file and use `import`:
+
+```bash
+cat <<'YAML' > /tmp/new-reqs.yaml
+- id: AUTH-024
+  type: constraint
+  priority: must
+  summary: Account status cannot revert to PENDING
+  accepts:
+    - Calling changeStatus(PENDING) on a non-PENDING account has no effect
+  tags: [status]
+YAML
+specs/req import /tmp/new-reqs.yaml
+```
+
+**Important:** `import` requires a file path — it does not read from stdin. The `update`
+command reads YAML from stdin (piped), but `import` does not.
 
 ## Conversational Examples
 
