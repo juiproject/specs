@@ -37,7 +37,13 @@ first (the YAML snapshots in `specs/snapshots/` are the git-versioned source of 
 | List modules | `specs/req module list` |
 | Add (interactive or YAML stdin) | `specs/req add [module]` |
 | Import from YAML file | `specs/req import [module] <file.yaml>` |
-| Snapshot for git | `specs/req snapshot` |
+| Approve a requirement | `specs/req approve <ID> [--module M]` |
+| Revert revised to approved | `specs/req revert <ID> [--module M]` |
+| Withdraw approval | `specs/req withdraw <ID> [--module M]` |
+| Diff approved vs revised | `specs/req diff <ID> [--module M]` |
+| Show approved version | `specs/req show <ID> --approved [--module M]` |
+| List by approval status | `specs/req list --approval <proposed\|approved\|revised>` |
+| Snapshot for git | `specs/req snapshot` (runs automatically via git pre-commit hook — do not run manually) |
 | Restore from snapshots | `specs/req restore` |
 
 ## Creating Requirements
@@ -100,6 +106,13 @@ domain associations on import.
 | "show requirements in the org domain" | `specs/req list --domain org` |
 | "export org domain as yaml" | `specs/req export --domain org` |
 | "delete the email-service domain" | `specs/req domain rm email-service` |
+| "approve AUTH-001" | `specs/req approve AUTH-001` |
+| "revert AUTH-005 to approved" | `specs/req revert AUTH-005` |
+| "withdraw approval on BIZ-003" | `specs/req withdraw BIZ-003` |
+| "show diff for AUTH-001" | `specs/req diff AUTH-001` |
+| "show the approved version of AUTH-001" | `specs/req show AUTH-001 --approved` |
+| "list all proposed requirements" | `specs/req list --approval proposed` |
+| "which requirements need re-approval?" | `specs/req list --approval revised` |
 
 ### Category name mapping
 
@@ -126,6 +139,7 @@ When the user refers to a category by its domain name, map to the code:
 | `--category` | `AUTH`, `DATA`, `UI`, `API`, `PERF`, `SEC`, `INT`, `BIZ`, `INF` | all |
 | `--type` | `functional`, `non-functional`, `constraint`, `interface` | all |
 | `--status` | `active`, `deprecated`, `deleted` | `active` |
+| `--approval` | `proposed`, `approved`, `revised` | all |
 | `--tag` | any tag string | all |
 | `--domain` | domain reference | all |
 | `--format` | `yaml`, `csv` (export only) | `yaml` |
@@ -138,6 +152,10 @@ To update acceptance criteria (or any combination of fields), use the `update` c
 with YAML on stdin. Workflow: `show --format yaml` → edit the YAML → pipe to `update`.
 
 Tags, dependencies, and domains can also be managed via `tag`, `depend`, and `domain` commands.
+
+**Auto-transition**: Editing `summary`, `detail`, or acceptance criteria on an `approved`
+requirement automatically transitions it to `revised`. The previously-approved content is
+saved as mirror fields so it can be compared (`diff`) or restored (`revert`).
 
 ## Display IDs
 

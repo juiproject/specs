@@ -31,6 +31,10 @@
 #   domain list [--module M]                         List domains
 #   domain rm <ref> [--module M]                     Remove a domain
 #   domain <display_id> add|rm <ref> [--module M]   Assign/unassign domain
+#   approve <display_id> [--module M]  Approve a requirement (proposed→approved, revised→approved)
+#   revert <display_id> [--module M]   Revert a revised requirement to its approved state
+#   withdraw <display_id> [--module M] Withdraw approval (any→proposed)
+#   diff <display_id> [--module M]     Show diff between approved and revised versions
 #   rm <display_id> [--module M]      Soft-delete a requirement
 #   purge <days>                      Permanently remove soft-deleted requirements older than N days
 #   export [filters...]               Export to YAML or CSV
@@ -50,6 +54,7 @@
 #   --domain <d>          Filter by domain reference
 #   --type <t>            Filter by type (functional|non-functional|constraint|interface)
 #   --status <s>          Filter by status (active|deprecated|deleted) [default: active]
+#   --approval <a>        Filter by approval status (proposed|approved|revised)
 #   --format <f>          Output format for export (yaml|csv) [default: yaml]
 #
 # EXAMPLES:
@@ -119,6 +124,7 @@ VALID_CATEGORIES=("AUTH" "DATA" "UI" "API" "PERF" "SEC" "INT" "BIZ" "INF")
 VALID_PRIORITIES=("must" "should" "could" "wont")
 VALID_TYPES=("functional" "non-functional" "constraint" "interface")
 VALID_STATUSES=("active" "deprecated" "deleted")
+VALID_APPROVAL_STATUSES=("proposed" "approved" "revised")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -256,6 +262,42 @@ prompt_select() {
     fi
 }
 
+# Auto-transition an APPROVED requirement to REVISED.
+# Copies current summary, detail, and acceptance criteria to mirror fields.
+# Returns 0 if transition occurred, 1 if not applicable (not approved).
+auto_transition_to_revised() {
+    local rid="$1"
+    local current_approval
+    current_approval=$(sql "SELECT approval_status FROM requirements WHERE id=${rid};")
+    if [[ "$current_approval" != "approved" ]]; then
+        return 1
+    fi
+
+    sql "UPDATE requirements SET
+        approved_summary = summary,
+        approved_detail = detail,
+        approval_status = 'revised',
+        revised_at = datetime('now'),
+        updated_at = datetime('now')
+    WHERE id = ${rid};"
+
+    sql "INSERT INTO approved_acceptance (requirement_id, criterion, sort_order)
+         SELECT requirement_id, criterion, sort_order
+         FROM acceptance WHERE requirement_id = ${rid};"
+
+    return 0
+}
+
+# Clear all mirror/approval fields on a requirement.
+clear_mirror_fields() {
+    local rid="$1"
+    sql "UPDATE requirements SET
+        approved_summary = NULL,
+        approved_detail = NULL
+    WHERE id = ${rid};"
+    sql "DELETE FROM approved_acceptance WHERE requirement_id = ${rid};"
+}
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -268,6 +310,23 @@ cmd_init() {
     [[ -f "$SCHEMA_PATH" ]] || die "Schema not found at ${SCHEMA_PATH}"
     sqlite3 "$DB_PATH" < "$SCHEMA_PATH"
     sql "INSERT OR IGNORE INTO modules (name, description) VALUES ('${DEFAULT_MODULE}', 'Default module');"
+
+    # Migration: add approval workflow columns if missing
+    local has_approval
+    has_approval=$(sql "SELECT COUNT(*) FROM pragma_table_info('requirements') WHERE name='approval_status';")
+    if [[ "$has_approval" -eq 0 ]]; then
+        sql "ALTER TABLE requirements ADD COLUMN approval_status TEXT DEFAULT 'proposed';"
+        sql "ALTER TABLE requirements ADD COLUMN approved_at TEXT;"
+        sql "ALTER TABLE requirements ADD COLUMN revised_at TEXT;"
+        sql "ALTER TABLE requirements ADD COLUMN approved_summary TEXT;"
+        sql "ALTER TABLE requirements ADD COLUMN approved_detail TEXT;"
+        sql "UPDATE requirements SET approval_status='proposed' WHERE approval_status IS NULL;"
+        # Recreate view to include new columns
+        sql "DROP VIEW IF EXISTS v_requirements;"
+        sqlite3 "$DB_PATH" < "$SCHEMA_PATH"
+        info "Migration: added approval workflow columns."
+    fi
+
     info "Database initialised at ${DB_PATH}"
 }
 
@@ -513,7 +572,7 @@ cmd_add() {
 cmd_add_yaml() {
     local module_id="$1"
 
-    local category="" type="" priority="" summary="" detail=""
+    local category="" type="" priority="" summary="" detail="" approval_status=""
     local in_accepts=false in_detail=false
     local -a accepts=()
     local -a tags=()
@@ -553,6 +612,8 @@ cmd_add_yaml() {
             type="${BASH_REMATCH[1]}"
         elif [[ "$line" =~ ^[[:space:]]+priority:[[:space:]]*(.*) ]]; then
             priority="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+approval_status:[[:space:]]*(.*) ]]; then
+            approval_status="${BASH_REMATCH[1]}"
         elif [[ "$line" =~ ^[[:space:]]+summary:[[:space:]]*(.*) ]]; then
             summary="${BASH_REMATCH[1]}"
         elif [[ "$line" =~ ^[[:space:]]+detail:[[:space:]]*\> ]]; then
@@ -593,15 +654,23 @@ cmd_add_yaml() {
     validate_in "$priority" "${VALID_PRIORITIES[@]}"
     [[ -n "$summary" ]] || die "Missing summary field"
 
+    # Validate or default approval_status
+    if [[ -n "$approval_status" ]]; then
+        validate_in "$approval_status" "${VALID_APPROVAL_STATUSES[@]}"
+    else
+        approval_status="proposed"
+    fi
+
     local seq
     seq=$(next_seq "$module_id" "$category")
     local display_id="${category}-$(printf '%03d' "$seq")"
 
     local rid
-    rid=$(sql "INSERT INTO requirements (module_id, category, seq, type, priority, summary, detail)
+    rid=$(sql "INSERT INTO requirements (module_id, category, seq, type, priority, summary, detail, approval_status)
          VALUES (${module_id}, '${category}', ${seq}, '${type}', '${priority}',
                  '$(echo "$summary" | sed "s/'/''/g")',
-                 '$(echo "$detail" | sed "s/'/''/g")');
+                 '$(echo "$detail" | sed "s/'/''/g")',
+                 '${approval_status}');
          SELECT last_insert_rowid();")
 
     # Insert acceptance criteria
@@ -715,7 +784,7 @@ cmd_import() {
     local in_tags=false
     local in_depends=false
     local in_detail=false
-    local category="" seq="" type="" priority="" summary="" detail=""
+    local category="" seq="" type="" priority="" summary="" detail="" approval_status=""
     local -a accepts=()
     local -a tags=()
     local -a depends=()
@@ -742,17 +811,20 @@ cmd_import() {
         if [[ -n "$existing" ]]; then
             warn "  Skipped ${display_id}: already exists"
             skipped=$((skipped + 1))
-            category="" seq="" type="" priority="" summary="" detail=""
+            category="" seq="" type="" priority="" summary="" detail="" approval_status=""
             accepts=() tags=() depends=() domains=()
             in_accepts=false in_tags=false in_depends=false in_detail=false
             return 0
         fi
 
+        local use_approval="${approval_status:-proposed}"
+
         local rid
-        rid=$(sql "INSERT INTO requirements (module_id, category, seq, type, priority, summary, detail)
+        rid=$(sql "INSERT INTO requirements (module_id, category, seq, type, priority, summary, detail, approval_status)
              VALUES (${module_id}, '${category}', ${use_seq}, '${type}', '${priority}',
                      '$(echo "$summary" | sed "s/'/''/g")',
-                     '$(echo "$detail" | sed "s/'/''/g")');
+                     '$(echo "$detail" | sed "s/'/''/g")',
+                     '${use_approval}');
              SELECT last_insert_rowid();")
 
         local order=0
@@ -789,7 +861,7 @@ cmd_import() {
         count=$((count + 1))
 
         # Reset
-        category="" seq="" type="" priority="" summary="" detail=""
+        category="" seq="" type="" priority="" summary="" detail="" approval_status=""
         accepts=() tags=() depends=() domains=()
         in_accepts=false in_tags=false in_depends=false in_detail=false
     }
@@ -863,6 +935,8 @@ cmd_import() {
                 dm=$(echo "$dm" | xargs)
                 [[ -n "$dm" ]] && domains+=("$dm")
             done
+        elif [[ "$line" =~ ^[[:space:]]+approval_status:[[:space:]]*(.*) ]]; then
+            approval_status="${BASH_REMATCH[1]}"
         fi
 
     done < "$yaml_file"
@@ -886,7 +960,7 @@ cmd_import() {
 cmd_list() {
     require_db
 
-    local module="" priority="" category="" tag="" type="" status="active" domain=""
+    local module="" priority="" category="" tag="" type="" status="active" domain="" approval=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -897,6 +971,7 @@ cmd_list() {
             --type)     type="$2"; shift 2 ;;
             --status)   status="$2"; shift 2 ;;
             --domain)   domain="$2"; shift 2 ;;
+            --approval) approval="$2"; shift 2 ;;
             *) die "Unknown option: $1" ;;
         esac
     done
@@ -906,6 +981,7 @@ cmd_list() {
     [[ -n "$priority" ]] && where="${where} AND r.priority='${priority}'"
     [[ -n "$category" ]] && where="${where} AND r.category='${category}'"
     [[ -n "$type" ]]     && where="${where} AND r.type='${type}'"
+    [[ -n "$approval" ]] && where="${where} AND r.approval_status='${approval}'"
 
     local join=""
     if [[ -n "$tag" ]]; then
@@ -922,6 +998,7 @@ cmd_list() {
         m.name AS module,
         r.priority,
         r.type,
+        r.approval_status AS approval,
         substr(r.summary, 1, 60) AS summary,
         COALESCE((SELECT GROUP_CONCAT(d.reference, ', ')
                   FROM requirement_domains rd
@@ -951,11 +1028,12 @@ cmd_show() {
     [[ -n "$display_id" ]] || die "Usage: req show <display_id> [--module M] [--format yaml]"
     shift
 
-    local module="" format=""
+    local module="" format="" show_approved=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --module) module="$2"; shift 2 ;;
             --format) format="$2"; shift 2 ;;
+            --approved) show_approved=true; shift ;;
             *) die "Unknown option: $1" ;;
         esac
     done
@@ -971,7 +1049,7 @@ cmd_show() {
     rid=$(resolve_requirement "$display_id" "$module_id")
 
     if [[ "$format" == "yaml" ]]; then
-        cmd_show_yaml "$rid" "$display_id"
+        cmd_show_yaml "$rid" "$display_id" "$show_approved"
         return
     fi
 
@@ -982,26 +1060,48 @@ cmd_show() {
         r.type,
         r.priority,
         r.status,
+        r.approval_status,
+        COALESCE(r.approved_at, '') AS approved_at,
+        COALESCE(r.revised_at, '') AS revised_at,
         r.created_at,
         r.updated_at
     FROM requirements r
     JOIN modules m ON m.id = r.module_id
     WHERE r.id = ${rid};"
 
-    local summary
-    summary=$(sql "SELECT summary FROM requirements WHERE id=${rid};")
-    echo ""
-    echo "Summary: ${summary}"
+    local appr_status
+    appr_status=$(sql "SELECT approval_status FROM requirements WHERE id=${rid};")
 
-    local detail
-    detail=$(sql "SELECT detail FROM requirements WHERE id=${rid};")
-    if [[ -n "$detail" ]]; then
-        echo "Detail: ${detail}"
+    if $show_approved && [[ "$appr_status" == "revised" ]]; then
+        local summary detail
+        summary=$(sql "SELECT approved_summary FROM requirements WHERE id=${rid};")
+        detail=$(sql "SELECT COALESCE(approved_detail,'') FROM requirements WHERE id=${rid};")
+        echo ""
+        echo "Summary (approved): ${summary}"
+        [[ -n "$detail" ]] && echo "Detail (approved): ${detail}"
+        echo ""
+        echo "Acceptance Criteria (approved):"
+        sql "SELECT '  - ' || criterion FROM approved_acceptance WHERE requirement_id=${rid} ORDER BY sort_order;"
+    else
+        if $show_approved && [[ "$appr_status" != "revised" ]]; then
+            warn "Requirement is not in REVISED state; showing current version."
+        fi
+
+        local summary
+        summary=$(sql "SELECT summary FROM requirements WHERE id=${rid};")
+        echo ""
+        echo "Summary: ${summary}"
+
+        local detail
+        detail=$(sql "SELECT detail FROM requirements WHERE id=${rid};")
+        if [[ -n "$detail" ]]; then
+            echo "Detail: ${detail}"
+        fi
+
+        echo ""
+        echo "Acceptance Criteria:"
+        sql "SELECT '  - ' || criterion FROM acceptance WHERE requirement_id=${rid} ORDER BY sort_order;"
     fi
-
-    echo ""
-    echo "Acceptance Criteria:"
-    sql "SELECT '  - ' || criterion FROM acceptance WHERE requirement_id=${rid} ORDER BY sort_order;"
 
     local tag_list
     tag_list=$(sql "SELECT group_concat(tag, ', ') FROM requirement_tags WHERE requirement_id=${rid} AND tag NOT LIKE 'depends:%';")
@@ -1026,19 +1126,29 @@ cmd_show() {
 }
 
 # Output a single requirement as YAML (reuses export format).
-# Usage: cmd_show_yaml <internal_rid> <display_id>
+# Usage: cmd_show_yaml <internal_rid> <display_id> [show_approved]
 cmd_show_yaml() {
     local rid="$1"
     local display_id="$2"
+    local show_approved="${3:-false}"
 
-    local type_val pri summ det
-    IFS=$'\t' read -r type_val pri summ det < <(sql_tsv "SELECT
-        r.type, r.priority, r.summary, COALESCE(r.detail, '')
+    local type_val pri summ det approval_status approved_at revised_at
+    IFS=$'\t' read -r type_val pri summ det approval_status approved_at revised_at < <(sql_tsv "SELECT
+        r.type, r.priority, r.summary,
+        CASE WHEN r.detail IS NULL OR r.detail = '' THEN '<NONE>' ELSE r.detail END,
+        r.approval_status, COALESCE(r.approved_at, '<NONE>'), COALESCE(r.revised_at, '<NONE>')
     FROM requirements r WHERE r.id = ${rid};")
+
+    [[ "$det" == "<NONE>" ]] && det=""
+    [[ "$approved_at" == "<NONE>" ]] && approved_at=""
+    [[ "$revised_at" == "<NONE>" ]] && revised_at=""
 
     echo "- id: ${display_id}"
     echo "  type: ${type_val}"
     echo "  priority: ${pri}"
+    echo "  approval_status: ${approval_status}"
+    [[ -n "$approved_at" ]] && echo "  approved_at: ${approved_at}"
+    [[ -n "$revised_at" ]] && echo "  revised_at: ${revised_at}"
     echo "  summary: ${summ}"
     [[ -n "$det" ]] && echo "  detail: >" && echo "    ${det}"
 
@@ -1076,6 +1186,30 @@ cmd_show_yaml() {
         local tags_csv
         tags_csv=$(echo "$tag_list" | tr '\n' ',' | sed 's/,$//')
         echo "  tags: [${tags_csv}]"
+    fi
+
+    # Emit mirror fields when REVISED (for snapshot round-trip)
+    if [[ "$approval_status" == "revised" ]]; then
+        local approved_summ approved_det
+        IFS=$'\t' read -r approved_summ approved_det < <(sql_tsv "SELECT
+            COALESCE(r.approved_summary, '<NONE>'), COALESCE(r.approved_detail, '<NONE>')
+        FROM requirements r WHERE r.id = ${rid};")
+        [[ "$approved_summ" == "<NONE>" ]] && approved_summ=""
+        [[ "$approved_det" == "<NONE>" ]] && approved_det=""
+        [[ -n "$approved_summ" ]] && echo "  approved_summary: ${approved_summ}"
+        if [[ -n "$approved_det" ]]; then
+            echo "  approved_detail: >"
+            echo "    ${approved_det}"
+        fi
+
+        local approved_criteria
+        approved_criteria=$(sql "SELECT criterion FROM approved_acceptance WHERE requirement_id=${rid} ORDER BY sort_order;")
+        if [[ -n "$approved_criteria" ]]; then
+            echo "  approved_accepts:"
+            while IFS= read -r acrit; do
+                echo "    - ${acrit}"
+            done <<< "$approved_criteria"
+        fi
     fi
 }
 
@@ -1119,6 +1253,11 @@ cmd_edit() {
         summary|detail) ;;
         *) die "Editable fields: type, priority, summary, detail, status" ;;
     esac
+
+    # Auto-transition to REVISED if editing content fields on an APPROVED requirement
+    if [[ "$field" == "summary" || "$field" == "detail" ]]; then
+        auto_transition_to_revised "$rid" || true
+    fi
 
     sql "UPDATE requirements SET ${field}='$(echo "$value" | sed "s/'/''/g")', updated_at=datetime('now') WHERE id=${rid};"
     info "Updated ${display_id} ${field} → ${value}"
@@ -1244,6 +1383,11 @@ cmd_update() {
             done
         fi
     done
+
+    # Auto-transition to REVISED if editing content fields on an APPROVED requirement
+    if [[ -n "$summary" || -n "$detail" ]] || $has_accepts; then
+        auto_transition_to_revised "$rid" || true
+    fi
 
     # Build UPDATE SET clause for scalar fields (only those present)
     local sets=""
@@ -1463,6 +1607,236 @@ cmd_purge() {
     info "Purged ${purge_count} requirement(s)."
 }
 
+# --- approve ---------------------------------------------------------------
+# Approve a requirement.
+#   PROPOSED -> APPROVED: sets approved_at.
+#   REVISED  -> APPROVED: discards mirror fields, sets approved_at.
+#
+# Usage: req approve <display_id> [--module M]
+# --------------------------------------------------------------------------
+cmd_approve() {
+    require_db
+    local display_id="${1:-}"
+    [[ -n "$display_id" ]] || die "Usage: req approve <display_id> [--module M]"
+    shift
+
+    local module=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --module) module="$2"; shift 2 ;;
+            *)        die "Unknown option: $1" ;;
+        esac
+    done
+
+    local module_id
+    if [[ -n "$module" ]]; then
+        module_id=$(resolve_module "$module")
+    else
+        module_id=$(default_module_id)
+    fi
+
+    local rid
+    rid=$(resolve_requirement "$display_id" "$module_id")
+
+    local current
+    current=$(sql "SELECT approval_status FROM requirements WHERE id=${rid};")
+
+    if [[ "$current" == "approved" ]]; then
+        die "${display_id} is already approved."
+    fi
+
+    if [[ "$current" == "proposed" ]]; then
+        sql "UPDATE requirements SET
+            approval_status='approved',
+            approved_at=datetime('now'),
+            updated_at=datetime('now')
+        WHERE id=${rid};"
+        info "Approved ${display_id} (proposed -> approved)"
+        return
+    fi
+
+    if [[ "$current" == "revised" ]]; then
+        clear_mirror_fields "$rid"
+        sql "UPDATE requirements SET
+            approval_status='approved',
+            approved_at=datetime('now'),
+            revised_at=NULL,
+            updated_at=datetime('now')
+        WHERE id=${rid};"
+        info "Approved ${display_id} (revised -> approved, mirror discarded)"
+        return
+    fi
+
+    die "Unexpected approval_status '${current}' for ${display_id}"
+}
+
+# --- revert ---------------------------------------------------------------
+# Revert a REVISED requirement back to its approved version.
+# Restores summary, detail, and acceptance from mirror fields.
+# Only valid when approval_status='revised'.
+#
+# Usage: req revert <display_id> [--module M]
+# --------------------------------------------------------------------------
+cmd_revert() {
+    require_db
+    local display_id="${1:-}"
+    [[ -n "$display_id" ]] || die "Usage: req revert <display_id> [--module M]"
+    shift
+
+    local module=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --module) module="$2"; shift 2 ;;
+            *)        die "Unknown option: $1" ;;
+        esac
+    done
+
+    local module_id
+    if [[ -n "$module" ]]; then
+        module_id=$(resolve_module "$module")
+    else
+        module_id=$(default_module_id)
+    fi
+
+    local rid
+    rid=$(resolve_requirement "$display_id" "$module_id")
+
+    local current
+    current=$(sql "SELECT approval_status FROM requirements WHERE id=${rid};")
+    [[ "$current" == "revised" ]] || die "${display_id} is not in REVISED state (current: ${current})."
+
+    # Restore summary and detail from mirror
+    sql "UPDATE requirements SET
+        summary = approved_summary,
+        detail = approved_detail,
+        approval_status = 'approved',
+        revised_at = NULL,
+        approved_summary = NULL,
+        approved_detail = NULL,
+        updated_at = datetime('now')
+    WHERE id = ${rid};"
+
+    # Restore acceptance criteria from mirror
+    sql "DELETE FROM acceptance WHERE requirement_id = ${rid};"
+    sql "INSERT INTO acceptance (requirement_id, criterion, sort_order)
+         SELECT requirement_id, criterion, sort_order
+         FROM approved_acceptance WHERE requirement_id = ${rid};"
+    sql "DELETE FROM approved_acceptance WHERE requirement_id = ${rid};"
+
+    info "Reverted ${display_id} to approved version."
+}
+
+# --- withdraw --------------------------------------------------------------
+# Withdraw approval from a requirement. Transitions any state to PROPOSED.
+# Clears approved_at, revised_at, and all mirror fields.
+#
+# Usage: req withdraw <display_id> [--module M]
+# --------------------------------------------------------------------------
+cmd_withdraw() {
+    require_db
+    local display_id="${1:-}"
+    [[ -n "$display_id" ]] || die "Usage: req withdraw <display_id> [--module M]"
+    shift
+
+    local module=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --module) module="$2"; shift 2 ;;
+            *)        die "Unknown option: $1" ;;
+        esac
+    done
+
+    local module_id
+    if [[ -n "$module" ]]; then
+        module_id=$(resolve_module "$module")
+    else
+        module_id=$(default_module_id)
+    fi
+
+    local rid
+    rid=$(resolve_requirement "$display_id" "$module_id")
+
+    local current
+    current=$(sql "SELECT approval_status FROM requirements WHERE id=${rid};")
+    [[ "$current" != "proposed" ]] || die "${display_id} is already in PROPOSED state."
+
+    clear_mirror_fields "$rid"
+    sql "UPDATE requirements SET
+        approval_status = 'proposed',
+        approved_at = NULL,
+        revised_at = NULL,
+        updated_at = datetime('now')
+    WHERE id = ${rid};"
+
+    info "Withdrawn ${display_id} (${current} -> proposed)"
+}
+
+# --- diff -----------------------------------------------------------------
+# Show differences between the approved and current (revised) versions.
+# Only meaningful when approval_status='revised'.
+#
+# Usage: req diff <display_id> [--module M]
+# --------------------------------------------------------------------------
+cmd_diff() {
+    require_db
+    local display_id="${1:-}"
+    [[ -n "$display_id" ]] || die "Usage: req diff <display_id> [--module M]"
+    shift
+
+    local module=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --module) module="$2"; shift 2 ;;
+            *)        die "Unknown option: $1" ;;
+        esac
+    done
+
+    local module_id
+    if [[ -n "$module" ]]; then
+        module_id=$(resolve_module "$module")
+    else
+        module_id=$(default_module_id)
+    fi
+
+    local rid
+    rid=$(resolve_requirement "$display_id" "$module_id")
+
+    local current
+    current=$(sql "SELECT approval_status FROM requirements WHERE id=${rid};")
+    [[ "$current" == "revised" ]] || die "${display_id} is not in REVISED state (current: ${current}). Nothing to diff."
+
+    local approved_file revised_file
+    approved_file=$(mktemp)
+    revised_file=$(mktemp)
+    trap "rm -f '$approved_file' '$revised_file'" EXIT
+
+    {
+        echo "Summary: $(sql "SELECT approved_summary FROM requirements WHERE id=${rid};")"
+        local appr_det
+        appr_det=$(sql "SELECT COALESCE(approved_detail,'') FROM requirements WHERE id=${rid};")
+        [[ -n "$appr_det" ]] && echo "Detail: ${appr_det}"
+        echo ""
+        echo "Acceptance Criteria:"
+        sql "SELECT '  - ' || criterion FROM approved_acceptance WHERE requirement_id=${rid} ORDER BY sort_order;"
+    } > "$approved_file"
+
+    {
+        echo "Summary: $(sql "SELECT summary FROM requirements WHERE id=${rid};")"
+        local curr_det
+        curr_det=$(sql "SELECT COALESCE(detail,'') FROM requirements WHERE id=${rid};")
+        [[ -n "$curr_det" ]] && echo "Detail: ${curr_det}"
+        echo ""
+        echo "Acceptance Criteria:"
+        sql "SELECT '  - ' || criterion FROM acceptance WHERE requirement_id=${rid} ORDER BY sort_order;"
+    } > "$revised_file"
+
+    echo "=== ${display_id}: Approved vs. Current (Revised) ==="
+    echo ""
+    diff -u --label "approved ($(sql "SELECT approved_at FROM requirements WHERE id=${rid};"))" \
+            --label "current ($(sql "SELECT revised_at FROM requirements WHERE id=${rid};"))" \
+            "$approved_file" "$revised_file" || true
+}
+
 # --- export ---------------------------------------------------------------
 # Export requirements to YAML or CSV format.
 #
@@ -1475,7 +1849,7 @@ cmd_purge() {
 cmd_export() {
     require_db
 
-    local module="" priority="" category="" tag="" type="" status="active" format="yaml" domain=""
+    local module="" priority="" category="" tag="" type="" status="active" format="yaml" domain="" approval=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1487,6 +1861,7 @@ cmd_export() {
             --status)   status="$2"; shift 2 ;;
             --format)   format="$2"; shift 2 ;;
             --domain)   domain="$2"; shift 2 ;;
+            --approval) approval="$2"; shift 2 ;;
             *) die "Unknown option: $1" ;;
         esac
     done
@@ -1496,6 +1871,7 @@ cmd_export() {
     [[ -n "$priority" ]] && where="${where} AND r.priority='${priority}'"
     [[ -n "$category" ]] && where="${where} AND r.category='${category}'"
     [[ -n "$type" ]]     && where="${where} AND r.type='${type}'"
+    [[ -n "$approval" ]] && where="${where} AND r.approval_status='${approval}'"
 
     local join=""
     if [[ -n "$tag" ]]; then
@@ -1508,7 +1884,7 @@ cmd_export() {
     fi
 
     if [[ "$format" == "csv" ]]; then
-        echo "id,module,category,type,priority,summary,detail,status"
+        echo "id,module,category,type,priority,summary,detail,status,approval_status"
         sql_tsv "SELECT
             r.category || '-' || printf('%03d', r.seq),
             m.name,
@@ -1517,7 +1893,8 @@ cmd_export() {
             r.priority,
             '\"' || replace(r.summary, '\"', '\"\"') || '\"',
             '\"' || replace(COALESCE(r.detail,''), '\"', '\"\"') || '\"',
-            r.status
+            r.status,
+            r.approval_status
         FROM requirements r
         JOIN modules m ON m.id = r.module_id
         ${join}
@@ -1530,7 +1907,11 @@ cmd_export() {
     local current_category=""
     local prev_module=""
 
-    while IFS=$'\t' read -r rid display_id mod cat type_val pri summ det; do
+    while IFS=$'\t' read -r rid display_id mod cat type_val pri summ det appr_status appr_at rev_at; do
+        [[ "$det" == "<NONE>" ]] && det=""
+        [[ "$appr_at" == "<NONE>" ]] && appr_at=""
+        [[ "$rev_at" == "<NONE>" ]] && rev_at=""
+
         if [[ "$mod" != "$prev_module" ]]; then
             [[ -n "$prev_module" ]] && echo ""
             echo "# === Module: ${mod} ==="
@@ -1548,6 +1929,9 @@ cmd_export() {
         echo "- id: ${display_id}"
         echo "  type: ${type_val}"
         echo "  priority: ${pri}"
+        echo "  approval_status: ${appr_status}"
+        [[ -n "$appr_at" ]] && echo "  approved_at: ${appr_at}"
+        [[ -n "$rev_at" ]] && echo "  revised_at: ${rev_at}"
         echo "  summary: ${summ}"
         [[ -n "$det" ]] && echo "  detail: >" && echo "    ${det}"
 
@@ -1599,7 +1983,10 @@ cmd_export() {
         r.type,
         r.priority,
         r.summary,
-        COALESCE(r.detail, '')
+        CASE WHEN r.detail IS NULL OR r.detail = '' THEN '<NONE>' ELSE r.detail END,
+        r.approval_status,
+        COALESCE(r.approved_at,'<NONE>'),
+        COALESCE(r.revised_at,'<NONE>')
     FROM requirements r
     JOIN modules m ON m.id = r.module_id
     ${join}
@@ -1649,6 +2036,14 @@ cmd_stats() {
         FROM requirements r JOIN modules m ON m.id = r.module_id
         ${where}
         GROUP BY r.type ORDER BY r.type;"
+
+    echo ""
+    echo "By Approval Status:"
+    sql_table "SELECT r.approval_status, COUNT(*) AS count
+        FROM requirements r JOIN modules m ON m.id = r.module_id
+        ${where}
+        GROUP BY r.approval_status ORDER BY
+            CASE r.approval_status WHEN 'proposed' THEN 1 WHEN 'approved' THEN 2 WHEN 'revised' THEN 3 END;"
 
     if [[ -z "$module" ]]; then
         echo ""
@@ -1741,6 +2136,22 @@ cmd_check() {
     fi
 
     echo ""
+
+    # Revised requirements needing re-approval
+    echo "Requirements needing re-approval (revised):"
+    local revised
+    revised=$(sql_table "SELECT r.category || '-' || printf('%03d', r.seq) AS id, m.name AS module, substr(r.summary,1,60) AS summary
+        FROM requirements r
+        JOIN modules m ON m.id = r.module_id
+        ${where} AND r.approval_status = 'revised';")
+    if [[ -n "$revised" ]]; then
+        echo "$revised"
+        issues=$((issues + 1))
+    else
+        echo "  None."
+    fi
+
+    echo ""
     if [[ $issues -eq 0 ]]; then
         info "✓ No issues found."
     else
@@ -1815,8 +2226,12 @@ cmd_snapshot() {
         local current_category=""
         local file_reqs=0
 
-        while IFS=$'\t' read -r rid display_id cat type_val pri summ det status; do
+        while IFS=$'\t' read -r rid display_id cat type_val pri summ det status appr_status appr_at rev_at appr_summ appr_det; do
             [[ "$det" == "<NONE>" ]] && det=""
+            [[ "$appr_at" == "<NONE>" ]] && appr_at=""
+            [[ "$rev_at" == "<NONE>" ]] && rev_at=""
+            [[ "$appr_summ" == "<NONE>" ]] && appr_summ=""
+            [[ "$appr_det" == "<NONE>" ]] && appr_det=""
             if [[ "$cat" != "$current_category" ]]; then
                 echo "" >> "$outfile"
                 echo "# --- ${cat} ---" >> "$outfile"
@@ -1828,6 +2243,9 @@ cmd_snapshot() {
             echo "  type: ${type_val}" >> "$outfile"
             echo "  priority: ${pri}" >> "$outfile"
             echo "  status: ${status}" >> "$outfile"
+            echo "  approval_status: ${appr_status}" >> "$outfile"
+            [[ -n "$appr_at" ]] && echo "  approved_at: ${appr_at}" >> "$outfile"
+            [[ -n "$rev_at" ]] && echo "  revised_at: ${rev_at}" >> "$outfile"
             echo "  summary: ${summ}" >> "$outfile"
             [[ -n "$det" ]] && echo "  detail: >" >> "$outfile" && echo "    ${det}" >> "$outfile"
 
@@ -1871,6 +2289,21 @@ cmd_snapshot() {
                 echo "  domains: [${domains_csv}]" >> "$outfile"
             fi
 
+            # Approved mirror fields (only when revised)
+            if [[ "$appr_status" == "revised" ]]; then
+                [[ -n "$appr_summ" ]] && echo "  approved_summary: ${appr_summ}" >> "$outfile"
+                [[ -n "$appr_det" ]] && echo "  approved_detail: >" >> "$outfile" && echo "    ${appr_det}" >> "$outfile"
+
+                local appr_criteria
+                appr_criteria=$(sql "SELECT criterion FROM approved_acceptance WHERE requirement_id=${rid} ORDER BY sort_order;")
+                if [[ -n "$appr_criteria" ]]; then
+                    echo "  approved_accepts:" >> "$outfile"
+                    while IFS= read -r acrit; do
+                        echo "    - ${acrit}" >> "$outfile"
+                    done <<< "$appr_criteria"
+                fi
+            fi
+
             req_count=$((req_count + 1))
             file_reqs=$((file_reqs + 1))
         done < <(sql_tsv "SELECT
@@ -1881,7 +2314,12 @@ cmd_snapshot() {
             r.priority,
             r.summary,
             CASE WHEN r.detail IS NULL OR r.detail = '' THEN '<NONE>' ELSE r.detail END,
-            r.status
+            r.status,
+            r.approval_status,
+            COALESCE(r.approved_at,'<NONE>'),
+            COALESCE(r.revised_at,'<NONE>'),
+            COALESCE(r.approved_summary,'<NONE>'),
+            COALESCE(r.approved_detail,'<NONE>')
         FROM requirements r
         JOIN modules m ON m.id = r.module_id
         WHERE m.name='$(echo "$module_name" | sed "s/'/''/g")'
@@ -2047,11 +2485,15 @@ cmd_restore() {
         local in_req=false
         local in_accepts=false
         local in_detail=false
+        local in_approved_accepts=false
+        local in_approved_detail=false
         local category="" seq="" type="" priority="" summary="" detail="" status=""
+        local approval_status="" approved_at="" revised_at="" approved_summary="" approved_detail=""
         local -a accepts=()
         local -a tags=()
         local -a depends=()
         local -a domains=()
+        local -a approved_accepts=()
         local file_reqs=0
 
         restore_flush() {
@@ -2067,19 +2509,39 @@ cmd_restore() {
             type="${type:-functional}"
             priority="${priority:-should}"
             status="${status:-active}"
+            approval_status="${approval_status:-proposed}"
+
+            # Build approved_at / revised_at SQL fragments
+            local appr_at_sql="NULL"
+            local rev_at_sql="NULL"
+            local appr_summ_sql="NULL"
+            local appr_det_sql="NULL"
+            [[ -n "$approved_at" ]] && appr_at_sql="'${approved_at}'"
+            [[ -n "$revised_at" ]] && rev_at_sql="'${revised_at}'"
+            [[ -n "$approved_summary" ]] && appr_summ_sql="'$(echo "$approved_summary" | sed "s/'/''/g")'"
+            [[ -n "$approved_detail" ]] && appr_det_sql="'$(echo "$approved_detail" | sed "s/'/''/g")'"
 
             local rid
-            rid=$(sql "INSERT INTO requirements (module_id, category, seq, type, priority, summary, detail, status)
+            rid=$(sql "INSERT INTO requirements (module_id, category, seq, type, priority, summary, detail, status, approval_status, approved_at, revised_at, approved_summary, approved_detail)
                  VALUES (${module_id}, '${category}', ${use_seq}, '${type}', '${priority}',
                          '$(echo "$summary" | sed "s/'/''/g")',
                          '$(echo "$detail" | sed "s/'/''/g")',
-                         '${status}');
+                         '${status}', '${approval_status}', ${appr_at_sql}, ${rev_at_sql},
+                         ${appr_summ_sql}, ${appr_det_sql});
                  SELECT last_insert_rowid();")
 
             local order=0
             for ac in ${accepts[@]+"${accepts[@]}"}; do
                 sql "INSERT INTO acceptance (requirement_id, criterion, sort_order)
                      VALUES (${rid}, '$(echo "$ac" | sed "s/'/''/g")', ${order});"
+                order=$((order + 1))
+            done
+
+            # Approved acceptance criteria (mirror)
+            order=0
+            for aac in ${approved_accepts[@]+"${approved_accepts[@]}"}; do
+                sql "INSERT INTO approved_acceptance (requirement_id, criterion, sort_order)
+                     VALUES (${rid}, '$(echo "$aac" | sed "s/'/''/g")', ${order});"
                 order=$((order + 1))
             done
 
@@ -2106,18 +2568,19 @@ cmd_restore() {
             total_reqs=$((total_reqs + 1))
 
             category="" seq="" type="" priority="" summary="" detail="" status=""
-            accepts=() tags=() depends=() domains=()
-            in_accepts=false in_detail=false
+            approval_status="" approved_at="" revised_at="" approved_summary="" approved_detail=""
+            accepts=() tags=() depends=() domains=() approved_accepts=()
+            in_accepts=false in_detail=false in_approved_accepts=false in_approved_detail=false
         }
 
         while IFS= read -r line || [[ -n "$line" ]]; do
             [[ "$line" =~ ^[[:space:]]*# ]] && continue
-            [[ "$line" =~ ^[[:space:]]*$ ]] && { in_detail=false; continue; }
+            [[ "$line" =~ ^[[:space:]]*$ ]] && { in_detail=false; in_approved_detail=false; continue; }
 
             if [[ "$line" =~ ^-[[:space:]]+id:[[:space:]]*([A-Z]+)-([0-9]+) ]]; then
                 restore_flush
                 in_req=true
-                in_accepts=false; in_detail=false
+                in_accepts=false; in_detail=false; in_approved_accepts=false; in_approved_detail=false
                 category="${BASH_REMATCH[1]}"
                 seq="${BASH_REMATCH[2]}"
                 continue
@@ -2125,11 +2588,29 @@ cmd_restore() {
 
             $in_req || continue
 
+            # Approved acceptance criteria items
+            if $in_approved_accepts && [[ "$line" =~ ^[[:space:]]+-[[:space:]]+(.*) ]]; then
+                approved_accepts+=("${BASH_REMATCH[1]}")
+                continue
+            elif $in_approved_accepts && [[ ! "$line" =~ ^[[:space:]]+- ]]; then
+                in_approved_accepts=false
+            fi
+
             if $in_accepts && [[ "$line" =~ ^[[:space:]]+-[[:space:]]+(.*) ]]; then
                 accepts+=("${BASH_REMATCH[1]}")
                 continue
             elif $in_accepts && [[ ! "$line" =~ ^[[:space:]]+- ]]; then
                 in_accepts=false
+            fi
+
+            # Approved detail continuation
+            if $in_approved_detail && [[ "$line" =~ ^[[:space:]]{4,} ]]; then
+                local trimmed
+                trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
+                approved_detail="${approved_detail} ${trimmed}"
+                continue
+            elif $in_approved_detail; then
+                in_approved_detail=false
             fi
 
             if $in_detail && [[ "$line" =~ ^[[:space:]]{4,} ]]; then
@@ -2147,6 +2628,20 @@ cmd_restore() {
                 priority="${BASH_REMATCH[1]}"
             elif [[ "$line" =~ ^[[:space:]]+status:[[:space:]]*(.*) ]]; then
                 status="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+approval_status:[[:space:]]*(.*) ]]; then
+                approval_status="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+approved_at:[[:space:]]*(.*) ]]; then
+                approved_at="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+revised_at:[[:space:]]*(.*) ]]; then
+                revised_at="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+approved_summary:[[:space:]]*(.*) ]]; then
+                approved_summary="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+approved_detail:[[:space:]]*\> ]]; then
+                in_approved_detail=true; approved_detail=""
+            elif [[ "$line" =~ ^[[:space:]]+approved_detail:[[:space:]]*(.*) ]]; then
+                approved_detail="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+approved_accepts: ]]; then
+                in_approved_accepts=true; in_accepts=false; in_detail=false; in_approved_detail=false
             elif [[ "$line" =~ ^[[:space:]]+summary:[[:space:]]*(.*) ]]; then
                 summary="${BASH_REMATCH[1]}"
             elif [[ "$line" =~ ^[[:space:]]+detail:[[:space:]]*\> ]]; then
@@ -2211,6 +2706,10 @@ main() {
         depend)  cmd_depend "$@" ;;
         rm)      cmd_rm "$@" ;;
         purge)   cmd_purge "$@" ;;
+        approve) cmd_approve "$@" ;;
+        revert)  cmd_revert "$@" ;;
+        withdraw) cmd_withdraw "$@" ;;
+        diff)    cmd_diff "$@" ;;
         export)  cmd_export "$@" ;;
         snapshot) cmd_snapshot "$@" ;;
         restore) cmd_restore "$@" ;;

@@ -37,6 +37,7 @@ Every requirement is a YAML block with these fields:
 | depends  |      | IDs this requirement relies on. |
 | tags     |      | Freeform labels for grouping. |
 | domains  |      | Domain references (must exist in DB). See `req domain list`. |
+| approval_status |  | `proposed` (default), `approved`, or `revised`. Omit to default to `proposed`. |
 
 ### Categories
 
@@ -186,7 +187,9 @@ After drafting extracted requirements in YAML:
      specs/req show AUTH-005 --format yaml | sed 's/should/must/' | specs/req update AUTH-005
      ```
      For single scalar fields, use `specs/req edit <ID> <field> <value>`.
-   - Run `specs/req snapshot` after all changes to update the git-versioned files.
+   - Do **not** run `specs/req snapshot` manually — a git pre-commit hook runs it automatically.
+   - Newly extracted requirements are imported with `approval_status: proposed` by default.
+     Set `approval_status` explicitly in YAML only if the user requests a different initial state.
 
 ### Standalone mode
 

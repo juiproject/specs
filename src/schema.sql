@@ -39,9 +39,10 @@ CREATE TABLE IF NOT EXISTS modules (
 -- One row per requirement. The display ID is derived as: category || '-' || seq
 -- formatted to 3 digits (e.g., AUTH-001).
 --
--- type:     functional | non-functional | constraint | interface
--- priority: must | should | could | wont
--- status:   active | deprecated | deleted
+-- type:            functional | non-functional | constraint | interface
+-- priority:        must | should | could | wont
+-- status:          active | deprecated | deleted
+-- approval_status: proposed | approved | revised
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS requirements (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,9 +53,14 @@ CREATE TABLE IF NOT EXISTS requirements (
     priority    TEXT    NOT NULL DEFAULT 'should' CHECK (priority IN ('must','should','could','wont')),
     summary     TEXT    NOT NULL,
     detail      TEXT,
-    status      TEXT    NOT NULL DEFAULT 'active' CHECK (status IN ('active','deprecated','deleted')),
-    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
-    updated_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    status           TEXT    NOT NULL DEFAULT 'active' CHECK (status IN ('active','deprecated','deleted')),
+    approval_status  TEXT    NOT NULL DEFAULT 'proposed' CHECK (approval_status IN ('proposed','approved','revised')),
+    approved_at      TEXT,
+    revised_at       TEXT,
+    approved_summary TEXT,
+    approved_detail  TEXT,
+    created_at       TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(module_id, category, seq)
 );
 
@@ -64,6 +70,19 @@ CREATE TABLE IF NOT EXISTS requirements (
 -- least one, enforced by convention (not constraint) to allow drafts.
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS acceptance (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    requirement_id  INTEGER NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
+    criterion       TEXT    NOT NULL,
+    sort_order      INTEGER NOT NULL DEFAULT 0
+);
+
+-- ============================================================================
+-- APPROVED ACCEPTANCE CRITERIA (MIRROR)
+-- Stores the previously-approved version of acceptance criteria when a
+-- requirement transitions from APPROVED to REVISED. Cleared when approved
+-- or withdrawn.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS approved_acceptance (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     requirement_id  INTEGER NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
     criterion       TEXT    NOT NULL,
@@ -125,6 +144,7 @@ CREATE INDEX IF NOT EXISTS idx_req_category    ON requirements(category);
 CREATE INDEX IF NOT EXISTS idx_req_priority    ON requirements(priority);
 CREATE INDEX IF NOT EXISTS idx_req_status      ON requirements(status);
 CREATE INDEX IF NOT EXISTS idx_accept_req      ON acceptance(requirement_id);
+CREATE INDEX IF NOT EXISTS idx_approved_accept_req ON approved_acceptance(requirement_id);
 CREATE INDEX IF NOT EXISTS idx_tags_req        ON requirement_tags(requirement_id);
 CREATE INDEX IF NOT EXISTS idx_tags_tag        ON requirement_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_depends_req     ON requirement_depends(requirement_id);
@@ -150,6 +170,9 @@ SELECT
     r.summary,
     r.detail,
     r.status,
+    r.approval_status,
+    r.approved_at,
+    r.revised_at,
     r.created_at,
     r.updated_at
 FROM requirements r
