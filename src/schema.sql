@@ -95,6 +95,29 @@ CREATE TABLE IF NOT EXISTS requirement_depends (
 );
 
 -- ============================================================================
+-- DOMAINS
+-- Scoped within a module. Provides a grouping of requirements by area of
+-- applicability (e.g., email service, review mechanism, organisation).
+-- A requirement can belong to multiple domains (many-to-many).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS domains (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    module_id   INTEGER NOT NULL REFERENCES modules(id),
+    reference   TEXT    NOT NULL,
+    name        TEXT    NOT NULL,
+    description TEXT,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(module_id, reference)
+);
+
+CREATE TABLE IF NOT EXISTS requirement_domains (
+    requirement_id INTEGER NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
+    domain_id      INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+    PRIMARY KEY (requirement_id, domain_id)
+);
+
+-- ============================================================================
 -- INDEXES
 -- ============================================================================
 CREATE INDEX IF NOT EXISTS idx_req_module      ON requirements(module_id);
@@ -106,6 +129,9 @@ CREATE INDEX IF NOT EXISTS idx_tags_req        ON requirement_tags(requirement_i
 CREATE INDEX IF NOT EXISTS idx_tags_tag        ON requirement_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_depends_req     ON requirement_depends(requirement_id);
 CREATE INDEX IF NOT EXISTS idx_depends_target  ON requirement_depends(depends_on_id);
+CREATE INDEX IF NOT EXISTS idx_domains_module  ON domains(module_id);
+CREATE INDEX IF NOT EXISTS idx_reqdom_req      ON requirement_domains(requirement_id);
+CREATE INDEX IF NOT EXISTS idx_reqdom_domain   ON requirement_domains(domain_id);
 
 -- ============================================================================
 -- VIEWS

@@ -1,14 +1,6 @@
 ---
 name: req
-description: >
-  Query, browse, and manage the requirements database using the specs/req CLI.
-  Use this skill when the user asks to: list, show, search, filter, edit, delete,
-  tag, or get statistics about requirements. Also trigger when the user references
-  a requirement ID (like AUTH-001, BIZ-003), asks about requirement status or
-  priority, asks to change a requirement field, or asks "what requirements do we
-  have" for a category or module. Trigger for "req stats", "req check", "quality
-  check", "show requirements", "find requirements", or any conversational query
-  about the contents of the requirements database.
+description: "Query, browse, and manage the requirements database using the specs/req CLI. Use this skill when the user asks to: list, show, search, filter, edit, delete, tag, manage domains, or get statistics about requirements. Also trigger when the user references a requirement ID (like AUTH-001, BIZ-003), asks about requirement status or priority, asks to change a requirement field, asks about domains, or asks what requirements exist for a category, module, or domain. Trigger for req stats, req check, quality check, show requirements, find requirements, domain, or any conversational query about requirements."
 ---
 
 # Requirements Manager
@@ -33,26 +25,32 @@ first (the YAML snapshots in `specs/snapshots/` are the git-versioned source of 
 | Edit a single field | `specs/req edit <ID> <field> <value> [--module M]` |
 | Add/remove a tag | `specs/req tag <ID> add\|rm <tag> [--module M]` |
 | Add/remove a dependency | `specs/req depend <ID> add\|rm <target_id> [--module M]` |
+| Create a domain | `specs/req domain add <ref> <name> [desc] [--module M]` |
+| List domains | `specs/req domain list [--module M]` |
+| Remove a domain | `specs/req domain rm <ref> [--module M]` |
+| Assign/unassign domain | `specs/req domain <ID> add\|rm <ref> [--module M]` |
 | Soft-delete a requirement | `specs/req rm <ID> [--module M]` |
 | Permanently purge old deletes | `specs/req purge <days>` |
 | Get statistics | `specs/req stats [--module M]` |
 | Run quality checks | `specs/req check [--module M]` |
 | Export requirements | `specs/req export [filters...] [--format yaml\|csv]` |
 | List modules | `specs/req module list` |
-| Add (interactive) | `specs/req add [module]` |
+| Add (interactive or YAML stdin) | `specs/req add [module]` |
 | Import from YAML file | `specs/req import [module] <file.yaml>` |
 | Snapshot for git | `specs/req snapshot` |
 | Restore from snapshots | `specs/req restore` |
 
 ## Creating Requirements
 
-The `add` command is **interactive only** — it prompts for each field and cannot be used
-in non-interactive contexts (no `--batch` flag exists).
+The `add` command supports two modes:
 
-To create requirements non-interactively, write a YAML file and use `import`:
+1. **Interactive** — prompts for each field when run in a terminal.
+2. **YAML via stdin** — when stdin is piped, parses a single requirement YAML block.
+
+To create a requirement non-interactively, pipe YAML to `add`:
 
 ```bash
-cat <<'YAML' > /tmp/new-reqs.yaml
+specs/req add <<'YAML'
 - id: AUTH-024
   type: constraint
   priority: must
@@ -60,12 +58,20 @@ cat <<'YAML' > /tmp/new-reqs.yaml
   accepts:
     - Calling changeStatus(PENDING) on a non-PENDING account has no effect
   tags: [status]
+  domains: [auth]
 YAML
+```
+
+The `id` field provides the category; the sequence number is auto-assigned.
+
+To import multiple requirements at once, use `import` with a YAML file:
+
+```bash
 specs/req import /tmp/new-reqs.yaml
 ```
 
-**Important:** `import` requires a file path — it does not read from stdin. The `update`
-command reads YAML from stdin (piped), but `import` does not.
+Both `add` (stdin) and `import` (file) support the `domains:` field to create
+domain associations on import.
 
 ## Conversational Examples
 
@@ -87,6 +93,13 @@ command reads YAML from stdin (piped), but `import` does not.
 | "delete BIZ-002" | `specs/req rm BIZ-002` |
 | "show AUTH-005 as yaml" | `specs/req show AUTH-005 --format yaml` |
 | "change the acceptance criteria on AUTH-005" | `specs/req show AUTH-005 --format yaml`, edit, pipe to `specs/req update AUTH-005` |
+| "create a domain for email" | `specs/req domain add email-service "Email Service" "Email delivery and templating"` |
+| "list all domains" | `specs/req domain list` |
+| "assign BIZ-007 to the org domain" | `specs/req domain BIZ-007 add org` |
+| "remove BIZ-007 from the org domain" | `specs/req domain BIZ-007 rm org` |
+| "show requirements in the org domain" | `specs/req list --domain org` |
+| "export org domain as yaml" | `specs/req export --domain org` |
+| "delete the email-service domain" | `specs/req domain rm email-service` |
 
 ### Category name mapping
 
@@ -114,6 +127,7 @@ When the user refers to a category by its domain name, map to the code:
 | `--type` | `functional`, `non-functional`, `constraint`, `interface` | all |
 | `--status` | `active`, `deprecated`, `deleted` | `active` |
 | `--tag` | any tag string | all |
+| `--domain` | domain reference | all |
 | `--format` | `yaml`, `csv` (export only) | `yaml` |
 
 ## Editable Fields
@@ -123,7 +137,7 @@ The `edit` command supports scalar fields: `type`, `priority`, `summary`, `detai
 To update acceptance criteria (or any combination of fields), use the `update` command
 with YAML on stdin. Workflow: `show --format yaml` → edit the YAML → pipe to `update`.
 
-Tags and dependencies can also be managed via `tag` and `depend` commands.
+Tags, dependencies, and domains can also be managed via `tag`, `depend`, and `domain` commands.
 
 ## Display IDs
 

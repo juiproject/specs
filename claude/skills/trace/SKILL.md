@@ -1,14 +1,6 @@
 ---
 name: trace
-description: >
-  Inspect, manage, and verify requirements traceability between Java source code
-  and the requirements database. Use this skill when the user asks to: check which
-  requirements a class or method implements, mark requirements on code, verify
-  requirement coverage, find untested requirements, confirm code meets requirements,
-  add or remove @requirements javadoc tags, or asks about traceability between code
-  and requirements. Also trigger when the user mentions "@requirements", "trace",
-  "coverage", "which requirements", "mark the requirements", "confirm requirements",
-  or asks "does this code meet requirements" or "what requirements does this test".
+description: "Inspect, manage, and verify requirements traceability between Java source code and the requirements database. Use this skill when the user asks to: check which requirements a class or method implements, mark requirements on code, verify requirement coverage, find untested requirements, confirm code meets requirements, add or remove @requirements javadoc tags, or asks about traceability between code and requirements. Also trigger when the user mentions @requirements, trace, coverage, which requirements, mark the requirements, confirm requirements, or asks does this code meet requirements or what requirements does this test."
 ---
 
 # Requirements Traceability

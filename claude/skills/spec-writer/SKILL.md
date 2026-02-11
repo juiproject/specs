@@ -1,14 +1,6 @@
 ---
 name: spec-writer
-description: >
-  Extract, write, and manage system requirements in a structured YAML format, and
-  synchronize them with the requirements database. Use this skill when the user asks
-  to: extract requirements from code or documentation, write or draft system requirements,
-  review or audit an existing requirements spec, reverse-engineer what an application does
-  into formal requirements, or create a requirements document from a codebase, API, UI, or
-  conversation. Also trigger when the user mentions "extract requirements", "system spec",
-  "functional spec", or asks "what does this system do" about a codebase. For querying,
-  browsing, or editing existing requirements in the database, use the req skill instead.
+description: "Extract, write, and manage system requirements in a structured YAML format, and synchronize them with the requirements database. Use this skill when the user asks to: extract requirements from code or documentation, write or draft system requirements, review or audit an existing requirements spec, reverse-engineer what an application does into formal requirements, or create a requirements document from a codebase, API, UI, or conversation. Also trigger when the user mentions extract requirements, system spec, functional spec, or asks what does this system do about a codebase. For querying, browsing, or editing existing requirements in the database, use the req skill instead."
 ---
 
 # Spec Writer
@@ -28,7 +20,8 @@ Every requirement is a YAML block with these fields:
   detail: <optional, max 3 sentences>
   accepts: [<testable pass/fail statements>]  # Min 1
   depends: [<requirement IDs>]       # Optional
-  tags: [<domain tags>]              # Optional
+  tags: [<freeform labels>]          # Optional
+  domains: [<domain references>]     # Optional
 ```
 
 ### Field Rules
@@ -42,7 +35,8 @@ Every requirement is a YAML block with these fields:
 | detail   |      | Only when summary is insufficient. |
 | accepts  | ✓    | Testable pass/fail. Min 1 criterion. |
 | depends  |      | IDs this requirement relies on. |
-| tags     |      | Freeform domain grouping. |
+| tags     |      | Freeform labels for grouping. |
+| domains  |      | Domain references (must exist in DB). See `req domain list`. |
 
 ### Categories
 
@@ -126,6 +120,7 @@ Output requirements as a single YAML document grouped by category with category 
     - Weights not summing to 1.0 produce a validation error before save
     - Null ratings are excluded; score adjusts denominator
   tags: [reviews, scoring]
+  domains: [reviews]
 ```
 
 Save the output as a `.yaml` file (not `.md`) so it remains machine-parseable.
@@ -171,10 +166,26 @@ After drafting extracted requirements in YAML:
    ```
 
 4. **Apply changes** after user approval:
-   - **New**: Write a temporary YAML file and run `specs/req import <file.yaml>`.
-   - **Updates**: Use `specs/req edit <ID> <field> <value>` for each changed field.
-     Note: acceptance criteria cannot be edited via the CLI — flag these to the user
-     for manual review.
+   - **New**: Pipe the YAML block to `specs/req add` for each new requirement:
+     ```bash
+     specs/req add <<'YAML'
+     - id: AUTH-024
+       type: constraint
+       priority: must
+       summary: Account status cannot revert to PENDING
+       accepts:
+         - Calling changeStatus(PENDING) on a non-PENDING account has no effect
+       tags: [status]
+       domains: [auth]
+     YAML
+     ```
+     For multiple requirements at once, write a YAML file and run `specs/req import <file.yaml>`.
+   - **Updates**: Pipe updated YAML to `specs/req update <ID>` (supports all fields
+     including acceptance criteria, tags, and domains):
+     ```bash
+     specs/req show AUTH-005 --format yaml | sed 's/should/must/' | specs/req update AUTH-005
+     ```
+     For single scalar fields, use `specs/req edit <ID> <field> <value>`.
    - Run `specs/req snapshot` after all changes to update the git-versioned files.
 
 ### Standalone mode

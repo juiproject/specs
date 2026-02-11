@@ -102,6 +102,8 @@ do_scan() {
         # Extract requirement IDs from this line
         # Strip everything before @requirements, then parse IDs
         local ids_text="${content#*@requirements}"
+        # Strip trailing javadoc close (*/) if present (single-line format)
+        ids_text="${ids_text%%\*/*}"
         # Also read continuation lines from the file
         ids_text=$(collect_ids "$file" "$lineno" "$ids_text")
 

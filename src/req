@@ -19,7 +19,7 @@
 #   init                              Create or migrate the database
 #   module add <name> [description]   Register a named module
 #   module list                       List all modules
-#   add [module] [--batch]            Add a requirement (interactive or batch)
+#   add [module] [--batch]            Add a requirement (interactive, batch, or YAML via stdin)
 #   import [module] <file.yaml>       Import requirements from YAML
 #   list [filters...]                 List requirements with optional filters
 #   show <display_id> [--module M] [--format yaml]  Show full detail for one requirement
@@ -27,6 +27,10 @@
 #   edit <display_id> <field> <value> [--module M]  Update a single scalar field
 #   tag <display_id> add|rm <tag> [--module M]      Manage tags
 #   depend <display_id> add|rm <target_id> [--module M]  Manage dependencies
+#   domain add <ref> <name> [desc] [--module M]     Create a domain
+#   domain list [--module M]                         List domains
+#   domain rm <ref> [--module M]                     Remove a domain
+#   domain <display_id> add|rm <ref> [--module M]   Assign/unassign domain
 #   rm <display_id> [--module M]      Soft-delete a requirement
 #   purge <days>                      Permanently remove soft-deleted requirements older than N days
 #   export [filters...]               Export to YAML or CSV
@@ -43,6 +47,7 @@
 #   --priority <p>        Filter by priority (must|should|could|wont)
 #   --category <c>        Filter by category (AUTH|DATA|UI|API|PERF|SEC|INT|BIZ|INF)
 #   --tag <t>             Filter by tag
+#   --domain <d>          Filter by domain reference
 #   --type <t>            Filter by type (functional|non-functional|constraint|interface)
 #   --status <s>          Filter by status (active|deprecated|deleted) [default: active]
 #   --format <f>          Output format for export (yaml|csv) [default: yaml]
@@ -83,7 +88,11 @@
 #   - To add new commands, follow the cmd_* function pattern below.
 #   - Categories can be extended by modifying the CHECK constraint in schema.sql
 #     and the VALID_CATEGORIES array below.
-#   - Snapshots write one YAML file per module to specs/snapshots/<module>.yaml.
+#   - Domains provide within-module grouping of requirements by area of
+#     applicability. A requirement can belong to multiple domains (many-to-many).
+#     Use `req domain add <ref> <name>` to create, `req domain <ID> add <ref>` to assign.
+#   - Snapshots write one YAML file per module to specs/snapshots/<module>.yaml,
+#     plus specs/snapshots/domains.yaml for domain definitions.
 #     These files are the git-versioned source of truth. The database is derived.
 #   - The restore command rebuilds the database entirely from snapshot files.
 #   - A git pre-commit hook should run `req snapshot` before each commit.
@@ -197,6 +206,16 @@ next_seq() {
     echo $((max_seq + 1))
 }
 
+# Resolve a domain reference to its ID within a module, or die
+resolve_domain() {
+    local ref="$1"
+    local module_id="$2"
+    local did
+    did=$(sql "SELECT id FROM domains WHERE module_id=${module_id} AND reference='$(echo "$ref" | sed "s/'/''/g")';")
+    [[ -n "$did" ]] || die "Domain '${ref}' not found. Run 'req domain list' to see domains."
+    echo "$did"
+}
+
 # Prompt for input with a default value. Usage: prompt "Summary" "" result_var
 prompt_input() {
     local label="$1"
@@ -278,6 +297,138 @@ cmd_module() {
     esac
 }
 
+# --- domain ---------------------------------------------------------------
+# Manage domains and assign them to requirements.
+#
+# Management:
+#   domain add <reference> <name> [description] [--module M]
+#   domain list [--module M]
+#   domain rm <reference> [--module M]
+#
+# Assignment (first arg looks like a display ID):
+#   domain <display_id> add|rm <reference> [--module M]
+# --------------------------------------------------------------------------
+cmd_domain() {
+    require_db
+    local subcmd="${1:-}"; shift || true
+
+    # Disambiguate: if subcmd looks like a display ID, it's assignment
+    if [[ "$subcmd" =~ ^[A-Z]+-[0-9]+$ ]]; then
+        cmd_domain_assign "$subcmd" "$@"
+        return
+    fi
+
+    # Otherwise it's management
+    local module=""
+    case "$subcmd" in
+        add)
+            local ref="${1:-}"
+            local name="${2:-}"
+            [[ -n "$ref" && -n "$name" ]] || die "Usage: req domain add <reference> <name> [description] [--module M]"
+            shift 2
+            local desc=""
+            # Consume optional description (non-flag argument)
+            if [[ $# -gt 0 && "${1:0:2}" != "--" ]]; then
+                desc="$1"; shift
+            fi
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --module) module="$2"; shift 2 ;;
+                    *) die "Unknown option: $1" ;;
+                esac
+            done
+            local module_id
+            if [[ -n "$module" ]]; then
+                module_id=$(resolve_module "$module")
+            else
+                module_id=$(default_module_id)
+            fi
+            sql "INSERT INTO domains (module_id, reference, name, description)
+                 VALUES (${module_id}, '$(echo "$ref" | sed "s/'/''/g")',
+                         '$(echo "$name" | sed "s/'/''/g")',
+                         '$(echo "$desc" | sed "s/'/''/g")');"
+            info "Domain '${ref}' created."
+            ;;
+        list)
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --module) module="$2"; shift 2 ;;
+                    *) die "Unknown option: $1" ;;
+                esac
+            done
+            local where=""
+            if [[ -n "$module" ]]; then
+                local module_id
+                module_id=$(resolve_module "$module")
+                where="WHERE d.module_id=${module_id}"
+            fi
+            sql_table "SELECT d.reference, d.name, d.description, m.name AS module
+                       FROM domains d JOIN modules m ON m.id = d.module_id
+                       ${where} ORDER BY m.name, d.reference;"
+            ;;
+        rm)
+            local ref="${1:-}"
+            [[ -n "$ref" ]] || die "Usage: req domain rm <reference> [--module M]"
+            shift
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --module) module="$2"; shift 2 ;;
+                    *) die "Unknown option: $1" ;;
+                esac
+            done
+            local module_id
+            if [[ -n "$module" ]]; then
+                module_id=$(resolve_module "$module")
+            else
+                module_id=$(default_module_id)
+            fi
+            local did
+            did=$(resolve_domain "$ref" "$module_id")
+            sql "DELETE FROM requirement_domains WHERE domain_id=${did};"
+            sql "DELETE FROM domains WHERE id=${did};"
+            info "Domain '${ref}' removed."
+            ;;
+        *)
+            die "Usage: req domain <add|list|rm> or req domain <display_id> add|rm <reference>"
+            ;;
+    esac
+}
+
+cmd_domain_assign() {
+    local display_id="$1"
+    local action="${2:-}"
+    local ref="${3:-}"
+    [[ -n "$action" && -n "$ref" ]] || die "Usage: req domain <display_id> add|rm <reference> [--module M]"
+    shift 3
+
+    local module=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --module) module="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    local module_id
+    if [[ -n "$module" ]]; then
+        module_id=$(resolve_module "$module")
+    else
+        module_id=$(default_module_id)
+    fi
+
+    local rid did
+    rid=$(resolve_requirement "$display_id" "$module_id")
+    did=$(resolve_domain "$ref" "$module_id")
+
+    case "$action" in
+        add) sql "INSERT OR IGNORE INTO requirement_domains (requirement_id, domain_id) VALUES (${rid}, ${did});"
+             info "Domain '${ref}' added to ${display_id}" ;;
+        rm)  sql "DELETE FROM requirement_domains WHERE requirement_id=${rid} AND domain_id=${did};"
+             info "Domain '${ref}' removed from ${display_id}" ;;
+        *)   die "Usage: req domain <display_id> add|rm <reference>" ;;
+    esac
+}
+
 # --- add ------------------------------------------------------------------
 # Add a requirement interactively.
 # Prompts for category, type, priority, summary, detail, and acceptance
@@ -287,6 +438,7 @@ cmd_module() {
 #
 # Batch mode (--batch) reads from stdin as tab-separated fields:
 #   category<TAB>type<TAB>priority<TAB>summary<TAB>detail<TAB>criterion1;criterion2
+# When stdin is piped (non-interactive), YAML is parsed automatically.
 # --------------------------------------------------------------------------
 cmd_add() {
     require_db
@@ -297,6 +449,12 @@ cmd_add() {
 
     if [[ "${1:-}" == "--batch" ]]; then
         cmd_add_batch "$module_id"
+        return
+    fi
+
+    # If stdin is piped, parse YAML
+    if [[ ! -t 0 ]]; then
+        cmd_add_yaml "$module_id"
         return
     fi
 
@@ -345,6 +503,137 @@ cmd_add() {
     fi
 
     info ""
+    info "Created ${display_id}: ${summary}"
+}
+
+# --- add (YAML from stdin) ------------------------------------------------
+# Parses YAML from stdin using the same format as import/update.
+# The id field provides the category; seq is auto-assigned.
+# --------------------------------------------------------------------------
+cmd_add_yaml() {
+    local module_id="$1"
+
+    local category="" type="" priority="" summary="" detail=""
+    local in_accepts=false in_detail=false
+    local -a accepts=()
+    local -a tags=()
+    local -a depends=()
+    local -a domains=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && { in_detail=false; continue; }
+
+        # Extract category from id field
+        if [[ "$line" =~ ^-[[:space:]]+id:[[:space:]]*([A-Z]+)-[0-9]+ ]]; then
+            category="${BASH_REMATCH[1]}"
+            continue
+        fi
+
+        # Acceptance criteria items
+        if $in_accepts && [[ "$line" =~ ^[[:space:]]+-[[:space:]]+(.*) ]]; then
+            accepts+=("${BASH_REMATCH[1]}")
+            continue
+        elif $in_accepts && [[ ! "$line" =~ ^[[:space:]]+- ]]; then
+            in_accepts=false
+        fi
+
+        # Multi-line detail continuation
+        if $in_detail && [[ "$line" =~ ^[[:space:]]{4,} ]]; then
+            local trimmed
+            trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
+            detail="${detail} ${trimmed}"
+            continue
+        elif $in_detail; then
+            in_detail=false
+        fi
+
+        # Field parsing
+        if [[ "$line" =~ ^[[:space:]]+type:[[:space:]]*(.*) ]]; then
+            type="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+priority:[[:space:]]*(.*) ]]; then
+            priority="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+summary:[[:space:]]*(.*) ]]; then
+            summary="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+detail:[[:space:]]*\> ]]; then
+            in_detail=true
+            detail=""
+        elif [[ "$line" =~ ^[[:space:]]+detail:[[:space:]]*(.*) ]]; then
+            detail="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+accepts: ]]; then
+            in_accepts=true
+            in_detail=false
+        elif [[ "$line" =~ ^[[:space:]]+tags:[[:space:]]*\[(.*)\] ]]; then
+            IFS=',' read -ra raw_tags <<< "${BASH_REMATCH[1]}"
+            for t in "${raw_tags[@]}"; do
+                t=$(echo "$t" | xargs)
+                [[ -n "$t" ]] && tags+=("$t")
+            done
+        elif [[ "$line" =~ ^[[:space:]]+depends:[[:space:]]*\[(.*)\] ]]; then
+            IFS=',' read -ra raw_deps <<< "${BASH_REMATCH[1]}"
+            for d in "${raw_deps[@]}"; do
+                d=$(echo "$d" | xargs)
+                [[ -n "$d" ]] && depends+=("$d")
+            done
+        elif [[ "$line" =~ ^[[:space:]]+domains:[[:space:]]*\[(.*)\] ]]; then
+            IFS=',' read -ra raw_domains <<< "${BASH_REMATCH[1]}"
+            for dm in "${raw_domains[@]}"; do
+                dm=$(echo "$dm" | xargs)
+                [[ -n "$dm" ]] && domains+=("$dm")
+            done
+        fi
+    done
+
+    # Validate required fields
+    [[ -n "$category" ]] || die "Missing id field (provides category)"
+    validate_in "$category" "${VALID_CATEGORIES[@]}"
+    [[ -n "$type" ]] || die "Missing type field"
+    validate_in "$type" "${VALID_TYPES[@]}"
+    [[ -n "$priority" ]] || die "Missing priority field"
+    validate_in "$priority" "${VALID_PRIORITIES[@]}"
+    [[ -n "$summary" ]] || die "Missing summary field"
+
+    local seq
+    seq=$(next_seq "$module_id" "$category")
+    local display_id="${category}-$(printf '%03d' "$seq")"
+
+    local rid
+    rid=$(sql "INSERT INTO requirements (module_id, category, seq, type, priority, summary, detail)
+         VALUES (${module_id}, '${category}', ${seq}, '${type}', '${priority}',
+                 '$(echo "$summary" | sed "s/'/''/g")',
+                 '$(echo "$detail" | sed "s/'/''/g")');
+         SELECT last_insert_rowid();")
+
+    # Insert acceptance criteria
+    local order=0
+    for ac in ${accepts[@]+"${accepts[@]}"}; do
+        sql "INSERT INTO acceptance (requirement_id, criterion, sort_order)
+             VALUES (${rid}, '$(echo "$ac" | sed "s/'/''/g")', ${order});"
+        order=$((order + 1))
+    done
+
+    # Insert tags
+    for tag in ${tags[@]+"${tags[@]}"}; do
+        sql "INSERT OR IGNORE INTO requirement_tags (requirement_id, tag)
+             VALUES (${rid}, '$(echo "$tag" | sed "s/'/''/g")');"
+    done
+
+    # Insert dependencies
+    for dep in ${depends[@]+"${depends[@]}"}; do
+        local tid
+        tid=$(resolve_requirement "$dep" "$module_id")
+        sql "INSERT OR IGNORE INTO requirement_depends (requirement_id, depends_on_id)
+             VALUES (${rid}, ${tid});"
+    done
+
+    # Insert domain associations
+    for dm in ${domains[@]+"${domains[@]}"}; do
+        local did
+        did=$(resolve_domain "$dm" "$module_id")
+        sql "INSERT OR IGNORE INTO requirement_domains (requirement_id, domain_id)
+             VALUES (${rid}, ${did});"
+    done
+
     info "Created ${display_id}: ${summary}"
 }
 
@@ -430,6 +719,7 @@ cmd_import() {
     local -a accepts=()
     local -a tags=()
     local -a depends=()
+    local -a domains=()
 
     flush_requirement() {
         [[ -n "$category" && -n "$summary" ]] || return 0
@@ -453,7 +743,7 @@ cmd_import() {
             warn "  Skipped ${display_id}: already exists"
             skipped=$((skipped + 1))
             category="" seq="" type="" priority="" summary="" detail=""
-            accepts=() tags=() depends=()
+            accepts=() tags=() depends=() domains=()
             in_accepts=false in_tags=false in_depends=false in_detail=false
             return 0
         fi
@@ -483,12 +773,24 @@ cmd_import() {
                  VALUES (${rid}, 'depends:$(echo "$dep" | sed "s/'/''/g")');"
         done
 
+        # Domain associations
+        for dm in ${domains[@]+"${domains[@]}"}; do
+            local did
+            did=$(sql "SELECT id FROM domains WHERE module_id=${module_id} AND reference='$(echo "$dm" | sed "s/'/''/g")';")
+            if [[ -n "$did" ]]; then
+                sql "INSERT OR IGNORE INTO requirement_domains (requirement_id, domain_id)
+                     VALUES (${rid}, ${did});"
+            else
+                warn "  Domain '${dm}' not found for ${display_id} (skipped)"
+            fi
+        done
+
         info "  Imported ${display_id}: ${summary}"
         count=$((count + 1))
 
         # Reset
         category="" seq="" type="" priority="" summary="" detail=""
-        accepts=() tags=() depends=()
+        accepts=() tags=() depends=() domains=()
         in_accepts=false in_tags=false in_depends=false in_detail=false
     }
 
@@ -555,6 +857,12 @@ cmd_import() {
                 d=$(echo "$d" | xargs)
                 [[ -n "$d" ]] && depends+=("$d")
             done
+        elif [[ "$line" =~ ^[[:space:]]+domains:[[:space:]]*\[(.*)\] ]]; then
+            IFS=',' read -ra raw_domains <<< "${BASH_REMATCH[1]}"
+            for dm in "${raw_domains[@]}"; do
+                dm=$(echo "$dm" | xargs)
+                [[ -n "$dm" ]] && domains+=("$dm")
+            done
         fi
 
     done < "$yaml_file"
@@ -578,7 +886,7 @@ cmd_import() {
 cmd_list() {
     require_db
 
-    local module="" priority="" category="" tag="" type="" status="active"
+    local module="" priority="" category="" tag="" type="" status="active" domain=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -588,6 +896,7 @@ cmd_list() {
             --tag)      tag="$2"; shift 2 ;;
             --type)     type="$2"; shift 2 ;;
             --status)   status="$2"; shift 2 ;;
+            --domain)   domain="$2"; shift 2 ;;
             *) die "Unknown option: $1" ;;
         esac
     done
@@ -600,8 +909,12 @@ cmd_list() {
 
     local join=""
     if [[ -n "$tag" ]]; then
-        join="JOIN requirement_tags rt ON rt.requirement_id = r.id"
+        join="${join} JOIN requirement_tags rt ON rt.requirement_id = r.id"
         where="${where} AND rt.tag='$(echo "$tag" | sed "s/'/''/g")'"
+    fi
+    if [[ -n "$domain" ]]; then
+        join="${join} JOIN requirement_domains rdom ON rdom.requirement_id = r.id JOIN domains dom ON dom.id = rdom.domain_id"
+        where="${where} AND dom.reference='$(echo "$domain" | sed "s/'/''/g")'"
     fi
 
     sql_table "SELECT
@@ -609,7 +922,12 @@ cmd_list() {
         m.name AS module,
         r.priority,
         r.type,
-        substr(r.summary, 1, 72) AS summary
+        substr(r.summary, 1, 60) AS summary,
+        COALESCE((SELECT GROUP_CONCAT(d.reference, ', ')
+                  FROM requirement_domains rd
+                  JOIN domains d ON d.id = rd.domain_id
+                  WHERE rd.requirement_id = r.id
+                  ORDER BY d.reference), '') AS domains
     FROM requirements r
     JOIN modules m ON m.id = r.module_id
     ${join}
@@ -664,13 +982,22 @@ cmd_show() {
         r.type,
         r.priority,
         r.status,
-        r.summary,
-        r.detail,
         r.created_at,
         r.updated_at
     FROM requirements r
     JOIN modules m ON m.id = r.module_id
     WHERE r.id = ${rid};"
+
+    local summary
+    summary=$(sql "SELECT summary FROM requirements WHERE id=${rid};")
+    echo ""
+    echo "Summary: ${summary}"
+
+    local detail
+    detail=$(sql "SELECT detail FROM requirements WHERE id=${rid};")
+    if [[ -n "$detail" ]]; then
+        echo "Detail: ${detail}"
+    fi
 
     echo ""
     echo "Acceptance Criteria:"
@@ -679,6 +1006,13 @@ cmd_show() {
     local tag_list
     tag_list=$(sql "SELECT group_concat(tag, ', ') FROM requirement_tags WHERE requirement_id=${rid} AND tag NOT LIKE 'depends:%';")
     [[ -n "$tag_list" ]] && echo "" && echo "Tags: ${tag_list}"
+
+    local domain_list
+    domain_list=$(sql "SELECT group_concat(d.reference, ', ')
+        FROM requirement_domains rd
+        JOIN domains d ON d.id = rd.domain_id
+        WHERE rd.requirement_id=${rid};")
+    [[ -n "$domain_list" ]] && echo "Domains: ${domain_list}"
 
     local dep_list
     dep_list=$(sql "SELECT group_concat(
@@ -726,6 +1060,14 @@ cmd_show_yaml() {
         local dep_csv
         dep_csv=$(echo "$deps" | tr '\n' ',' | sed 's/,$//')
         echo "  depends: [${dep_csv}]"
+    fi
+
+    local domain_list
+    domain_list=$(sql "SELECT d.reference FROM requirement_domains rd JOIN domains d ON d.id = rd.domain_id WHERE rd.requirement_id=${rid} ORDER BY d.reference;")
+    if [[ -n "$domain_list" ]]; then
+        local domains_csv
+        domains_csv=$(echo "$domain_list" | tr '\n' ',' | sed 's/,$//')
+        echo "  domains: [${domains_csv}]"
     fi
 
     local tag_list
@@ -825,11 +1167,12 @@ cmd_update() {
 
     # Parse YAML from stdin
     local type="" priority="" summary="" detail=""
-    local has_accepts=false has_tags=false has_depends=false
+    local has_accepts=false has_tags=false has_depends=false has_domains=false
     local in_accepts=false in_detail=false
     local -a accepts=()
     local -a tags=()
     local -a depends=()
+    local -a domains=()
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -892,6 +1235,13 @@ cmd_update() {
                 d=$(echo "$d" | xargs)
                 [[ -n "$d" ]] && depends+=("$d")
             done
+        elif [[ "$line" =~ ^[[:space:]]+domains:[[:space:]]*\[(.*)\] ]]; then
+            has_domains=true
+            IFS=',' read -ra raw_domains <<< "${BASH_REMATCH[1]}"
+            for dm in "${raw_domains[@]}"; do
+                dm=$(echo "$dm" | xargs)
+                [[ -n "$dm" ]] && domains+=("$dm")
+            done
         fi
     done
 
@@ -949,8 +1299,19 @@ cmd_update() {
         done
     fi
 
+    # Update domains (replace all when domains: key was present)
+    if $has_domains; then
+        sql "DELETE FROM requirement_domains WHERE requirement_id=${rid};"
+        for dm in ${domains[@]+"${domains[@]}"}; do
+            local did
+            did=$(resolve_domain "$dm" "$module_id")
+            sql "INSERT OR IGNORE INTO requirement_domains (requirement_id, domain_id)
+                 VALUES (${rid}, ${did});"
+        done
+    fi
+
     # Touch updated_at even if only sub-tables changed
-    if [[ -z "$sets" ]] && ($has_accepts || $has_tags || $has_depends); then
+    if [[ -z "$sets" ]] && ($has_accepts || $has_tags || $has_depends || $has_domains); then
         sql "UPDATE requirements SET updated_at=datetime('now') WHERE id=${rid};"
     fi
 
@@ -1114,7 +1475,7 @@ cmd_purge() {
 cmd_export() {
     require_db
 
-    local module="" priority="" category="" tag="" type="" status="active" format="yaml"
+    local module="" priority="" category="" tag="" type="" status="active" format="yaml" domain=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1125,6 +1486,7 @@ cmd_export() {
             --type)     type="$2"; shift 2 ;;
             --status)   status="$2"; shift 2 ;;
             --format)   format="$2"; shift 2 ;;
+            --domain)   domain="$2"; shift 2 ;;
             *) die "Unknown option: $1" ;;
         esac
     done
@@ -1137,8 +1499,12 @@ cmd_export() {
 
     local join=""
     if [[ -n "$tag" ]]; then
-        join="JOIN requirement_tags rt ON rt.requirement_id = r.id"
+        join="${join} JOIN requirement_tags rt ON rt.requirement_id = r.id"
         where="${where} AND rt.tag='$(echo "$tag" | sed "s/'/''/g")'"
+    fi
+    if [[ -n "$domain" ]]; then
+        join="${join} JOIN requirement_domains rdom ON rdom.requirement_id = r.id JOIN domains dom ON dom.id = rdom.domain_id"
+        where="${where} AND dom.reference='$(echo "$domain" | sed "s/'/''/g")'"
     fi
 
     if [[ "$format" == "csv" ]]; then
@@ -1214,6 +1580,15 @@ cmd_export() {
             local tags_csv
             tags_csv=$(echo "$tag_list" | tr '\n' ',' | sed 's/,$//')
             echo "  tags: [${tags_csv}]"
+        fi
+
+        # Domains
+        local domain_list
+        domain_list=$(sql "SELECT dom.reference FROM requirement_domains rdom JOIN domains dom ON dom.id = rdom.domain_id WHERE rdom.requirement_id=${rid} ORDER BY dom.reference;")
+        if [[ -n "$domain_list" ]]; then
+            local domains_csv
+            domains_csv=$(echo "$domain_list" | tr '\n' ',' | sed 's/,$//')
+            echo "  domains: [${domains_csv}]"
         fi
 
     done < <(sql_tsv "SELECT
@@ -1403,6 +1778,30 @@ cmd_snapshot() {
         module_count=$((module_count + 1))
     done < <(sql_tsv "SELECT name, COALESCE(description,'') FROM modules ORDER BY name;")
 
+    # Export domain definitions
+    local domain_count=0
+    local domains_file="${SNAPSHOT_DIR}/domains.yaml"
+    local has_domains
+    has_domains=$(sql "SELECT COUNT(*) FROM domains;")
+    if [[ "$has_domains" -gt 0 ]]; then
+        echo "# Domain registry — auto-generated by 'req snapshot'" > "$domains_file"
+        echo "# Do not edit manually. Use 'req domain add' then 'req snapshot'." >> "$domains_file"
+        echo "" >> "$domains_file"
+
+        while IFS=$'\t' read -r mod_name ref dname ddesc; do
+            echo "- module: ${mod_name}" >> "$domains_file"
+            echo "  reference: ${ref}" >> "$domains_file"
+            echo "  name: ${dname}" >> "$domains_file"
+            [[ -n "$ddesc" ]] && echo "  description: ${ddesc}" >> "$domains_file"
+            domain_count=$((domain_count + 1))
+        done < <(sql_tsv "SELECT m.name, d.reference, d.name, COALESCE(d.description,'')
+                          FROM domains d JOIN modules m ON m.id = d.module_id
+                          ORDER BY m.name, d.reference;")
+        info "  domains.yaml: ${domain_count} domain(s)"
+    elif [[ -f "$domains_file" ]]; then
+        rm -f "$domains_file"
+    fi
+
     # Export each module's requirements
     local req_count=0
     while IFS= read -r module_name; do
@@ -1463,6 +1862,15 @@ cmd_snapshot() {
                 echo "  tags: [${tags_csv}]" >> "$outfile"
             fi
 
+            # Domains
+            local domain_list
+            domain_list=$(sql "SELECT dom.reference FROM requirement_domains rdom JOIN domains dom ON dom.id = rdom.domain_id WHERE rdom.requirement_id=${rid} ORDER BY dom.reference;")
+            if [[ -n "$domain_list" ]]; then
+                local domains_csv
+                domains_csv=$(echo "$domain_list" | tr '\n' ',' | sed 's/,$//')
+                echo "  domains: [${domains_csv}]" >> "$outfile"
+            fi
+
             req_count=$((req_count + 1))
             file_reqs=$((file_reqs + 1))
         done < <(sql_tsv "SELECT
@@ -1508,7 +1916,7 @@ cmd_restore() {
     local verify_errors=0
     for vf in "${SNAPSHOT_DIR}"/*.yaml; do
         local vf_base="${vf##*/}"
-        [[ "$vf_base" == "modules.yaml" ]] && continue
+        [[ "$vf_base" == "modules.yaml" || "$vf_base" == "domains.yaml" ]] && continue
         local vf_module="${vf_base%.yaml}"
 
         local -a seen_ids=()
@@ -1579,11 +1987,52 @@ cmd_restore() {
     fi
     info "Restored ${module_count} module(s)."
 
+    # Restore domains from domains.yaml (if present)
+    local domain_count=0
+    if [[ -f "${SNAPSHOT_DIR}/domains.yaml" ]]; then
+        local dmod="" dref="" dname="" ddesc=""
+
+        flush_domain() {
+            [[ -n "$dref" && -n "$dname" ]] || return 0
+            local dmid
+            dmid=$(sql "SELECT id FROM modules WHERE name='$(echo "$dmod" | sed "s/'/''/g")';")
+            if [[ -z "$dmid" ]]; then
+                warn "  Domain '${dref}': module '${dmod}' not found (skipped)"
+                dmod="" dref="" dname="" ddesc=""
+                return 0
+            fi
+            sql "INSERT INTO domains (module_id, reference, name, description)
+                 VALUES (${dmid}, '$(echo "$dref" | sed "s/'/''/g")',
+                         '$(echo "$dname" | sed "s/'/''/g")',
+                         '$(echo "$ddesc" | sed "s/'/''/g")');"
+            domain_count=$((domain_count + 1))
+            dmod="" dref="" dname="" ddesc=""
+        }
+
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+
+            if [[ "$line" =~ ^-[[:space:]]+module:[[:space:]]*(.*) ]]; then
+                flush_domain
+                dmod="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+reference:[[:space:]]*(.*) ]]; then
+                dref="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+name:[[:space:]]*(.*) ]]; then
+                dname="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+description:[[:space:]]*(.*) ]]; then
+                ddesc="${BASH_REMATCH[1]}"
+            fi
+        done < "${SNAPSHOT_DIR}/domains.yaml"
+        flush_domain
+        info "Restored ${domain_count} domain(s)."
+    fi
+
     # Restore requirements from each module YAML
     local total_reqs=0
     for yaml_file in "${SNAPSHOT_DIR}"/*.yaml; do
         local basename="${yaml_file##*/}"
-        [[ "$basename" == "modules.yaml" ]] && continue
+        [[ "$basename" == "modules.yaml" || "$basename" == "domains.yaml" ]] && continue
 
         local module_name="${basename%.yaml}"
         local module_id
@@ -1602,6 +2051,7 @@ cmd_restore() {
         local -a accepts=()
         local -a tags=()
         local -a depends=()
+        local -a domains=()
         local file_reqs=0
 
         restore_flush() {
@@ -1643,11 +2093,20 @@ cmd_restore() {
                      VALUES (${rid}, 'depends:$(echo "$dep" | sed "s/'/''/g")');"
             done
 
+            for dm in ${domains[@]+"${domains[@]}"}; do
+                local did
+                did=$(sql "SELECT id FROM domains WHERE module_id=${module_id} AND reference='$(echo "$dm" | sed "s/'/''/g")';")
+                if [[ -n "$did" ]]; then
+                    sql "INSERT OR IGNORE INTO requirement_domains (requirement_id, domain_id)
+                         VALUES (${rid}, ${did});"
+                fi
+            done
+
             file_reqs=$((file_reqs + 1))
             total_reqs=$((total_reqs + 1))
 
             category="" seq="" type="" priority="" summary="" detail="" status=""
-            accepts=() tags=() depends=()
+            accepts=() tags=() depends=() domains=()
             in_accepts=false in_detail=false
         }
 
@@ -1708,6 +2167,12 @@ cmd_restore() {
                     d=$(echo "$d" | xargs)
                     [[ -n "$d" ]] && depends+=("$d")
                 done
+            elif [[ "$line" =~ ^[[:space:]]+domains:[[:space:]]*\[(.*)\] ]]; then
+                IFS=',' read -ra raw_domains <<< "${BASH_REMATCH[1]}"
+                for dm in "${raw_domains[@]}"; do
+                    dm=$(echo "$dm" | xargs)
+                    [[ -n "$dm" ]] && domains+=("$dm")
+                done
             fi
         done < "$yaml_file"
 
@@ -1735,6 +2200,7 @@ main() {
     case "$cmd" in
         init)    cmd_init "$@" ;;
         module)  cmd_module "$@" ;;
+        domain)  cmd_domain "$@" ;;
         add)     cmd_add "$@" ;;
         import)  cmd_import "$@" ;;
         list)    cmd_list "$@" ;;
