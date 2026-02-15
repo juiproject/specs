@@ -583,8 +583,8 @@ cmd_add_yaml() {
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ "$line" =~ ^[[:space:]]*$ ]] && { in_detail=false; continue; }
 
-        # Extract category from id field
-        if [[ "$line" =~ ^-[[:space:]]+id:[[:space:]]*([A-Z]+)-[0-9]+ ]]; then
+        # Extract category from id field (accepts "BIZ-009" or just "BIZ")
+        if [[ "$line" =~ ^-[[:space:]]+id:[[:space:]]*([A-Z]+)(-[0-9]+)?[[:space:]]*$ ]]; then
             category="${BASH_REMATCH[1]}"
             continue
         fi
