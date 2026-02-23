@@ -38,7 +38,7 @@
 #   rm <display_id> [--module M]      Soft-delete a requirement
 #   purge <days>                      Permanently remove soft-deleted requirements older than N days
 #   export [filters...]               Export to YAML or CSV
-#   snapshot                          Export all modules to YAML files (for git)
+#   snapshot [--if-changed]            Export all modules to YAML files (for git)
 #   restore                           Rebuild database from snapshot YAML files
 #   stats [--module M]                Summary statistics
 #   check [--module M]                Quality checks (missing criteria, etc.)
@@ -2167,13 +2167,45 @@ cmd_check() {
 # Writes one file per module: specs/snapshots/<module-name>.yaml
 # Also writes specs/snapshots/modules.yaml with module metadata.
 #
-# Usage: req snapshot
+# Usage: req snapshot [--if-changed]
+#
+# With --if-changed, compares the database modification time against the
+# newest snapshot file. If the database has not been modified since the last
+# snapshot, exits with code 2 (no work needed). This avoids unnecessary
+# regeneration and git-add during pre-commit hooks.
+#
+# Exit codes:
+#   0 — snapshots were (re)generated
+#   1 — error
+#   2 — no changes detected (--if-changed only)
 #
 # Designed to be called from a git pre-commit hook so snapshots are always
 # in sync with the database at commit time.
 # --------------------------------------------------------------------------
 cmd_snapshot() {
+    local if_changed=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --if-changed) if_changed=true; shift ;;
+            *) die "snapshot: unknown option '$1'" ;;
+        esac
+    done
+
     require_db
+
+    if $if_changed; then
+        local newest=""
+        for f in "$SNAPSHOT_DIR"/*.yaml; do
+            [[ -f "$f" ]] || continue
+            if [[ -z "$newest" ]] || [[ "$f" -nt "$newest" ]]; then
+                newest="$f"
+            fi
+        done
+        if [[ -n "$newest" ]] && ! [[ "$DB_PATH" -nt "$newest" ]]; then
+            return 2
+        fi
+    fi
+
     mkdir -p "$SNAPSHOT_DIR"
 
     # Export module metadata

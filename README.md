@@ -29,6 +29,7 @@ Key capabilities beyond basic CRUD:
 - **Domains** - named groupings scoped to a module (e.g. `email-service`, `org`). Requirements can belong to multiple domains and be filtered by `--domain`.
 - **Approval workflow** - requirements start as `proposed`, can be `approved`, and automatically transition to `revised` when edited. Supports `approve`, `revert`, `withdraw`, and `diff` commands.
 - **Streaming add** - pipe single-requirement YAML to `req add` for non-interactive creation, including tags and domain associations.
+- **Incremental snapshots** - `req snapshot --if-changed` compares the database modification time against the newest snapshot file and skips regeneration when nothing has changed. Returns exit code 0 if snapshots were generated, 2 if no changes were detected. Designed for use in pre-commit hooks to avoid unnecessary work on every commit.
 
 ## `src/schema.sql`
 
@@ -101,15 +102,17 @@ echo "specs/requirements.db-wal" >> .gitignore
 echo "specs/requirements.db-shm" >> .gitignore
 ```
 
-5. Optionally, set up the pre-commit hook to auto-snapshot requirements before each commit:
+5. Optionally, set up the pre-commit hook to auto-snapshot requirements before each commit. The `--if-changed` flag skips snapshot regeneration when the database hasn't been modified since the last snapshot, keeping commits fast when no requirements have changed:
 
 ```bash
 mkdir -p .githooks
 cat > .githooks/pre-commit << 'HOOK'
 #!/usr/bin/env bash
+# Auto-snapshot requirements before commit (only if db changed)
 if [[ -f specs/req && -f specs/requirements.db ]]; then
-    specs/req snapshot
-    git add specs/snapshots/
+    if specs/req snapshot --if-changed; then
+        git add specs/snapshots/
+    fi
 fi
 HOOK
 chmod +x .githooks/pre-commit
